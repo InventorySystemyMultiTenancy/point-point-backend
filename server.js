@@ -412,6 +412,7 @@ async function initDatabase() {
       table.increments("id").primary();
       table.decimal("amount", 10, 2).notNullable();
       table.text("order_ids");
+      table.text("valorRecebidoDetalhado");
       table.timestamp("received_at").defaultTo(db.fn.now());
     });
     console.log("✅ Tabela 'super_admin_receivables' criada com sucesso");
@@ -519,6 +520,18 @@ async function initDatabase() {
       });
       console.log("Coluna active adicionada a tabela products");
     }
+    const hasValorRecebidoDetalhado = await db.schema.hasColumn(
+      "super_admin_receivables",
+      "valorRecebidoDetalhado",
+    );
+    if (!hasValorRecebidoDetalhado) {
+      await db.schema.alterTable("super_admin_receivables", (table) => {
+        table.text("valorRecebidoDetalhado");
+      });
+      console.log(
+        "Coluna 'valorRecebidoDetalhado' adicionada a super_admin_receivables",
+      );
+    }
   }
 
   const hasUsers = await db.schema.hasTable("users");
@@ -620,6 +633,23 @@ async function initDatabase() {
       table.string("hiddenBy");
     });
     console.log("✅ Coluna 'hiddenBy' adicionada à tabela orders");
+  }
+
+  const superAdminOrderColumns = [
+    { name: "repassadoSuperAdmin", type: "boolean" },
+    { name: "dataRepasseSuperAdmin", type: "timestamp" },
+    { name: "valorRecebido", type: "decimal" },
+  ];
+  for (const col of superAdminOrderColumns) {
+    const hasCol = await db.schema.hasColumn("orders", col.name);
+    if (!hasCol) {
+      await db.schema.table("orders", (table) => {
+        if (col.type === "boolean") table.boolean(col.name).defaultTo(false);
+        if (col.type === "timestamp") table.timestamp(col.name);
+        if (col.type === "decimal") table.decimal(col.name, 12, 2);
+      });
+      console.log(`Coluna '${col.name}' adicionada a orders`);
+    }
   }
 
   // ========== TABELA DE CATEGORIAS (Multi-tenancy) ==========
@@ -1086,7 +1116,7 @@ const authenticateToken = (req, res, next) => {
 };
 
 const authorizeAdmin = (req, res, next) => {
-  if (req.user.role !== "admin") {
+  if (req.user.role !== "admin" && req.user.role !== "superadmin") {
     return res
       .status(403)
       .json({ error: "Acesso negado. Requer permissão de administrador." });

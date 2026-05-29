@@ -100,6 +100,23 @@ router.post(
 // 4. Endpoint GET - Listar recebíveis
 router.get("/super-admin/receivables", superAdminAuth, async (req, res) => {
   try {
+    const hasReceivablesTable = await db.schema.hasTable(
+      "super_admin_receivables",
+    );
+    if (!hasReceivablesTable) {
+      return res.json({
+        success: true,
+        stats: { totalToReceive: 0, alreadyReceived: 0 },
+        history: [],
+        orders: [],
+      });
+    }
+
+    const hasValorRecebidoDetalhado = await db.schema.hasColumn(
+      "super_admin_receivables",
+      "valorRecebidoDetalhado",
+    );
+
     // A. Buscar IDs já processados na tabela de repasses
     const receivablesRows = await db("super_admin_receivables").select(
       "order_ids",
@@ -181,14 +198,13 @@ router.get("/super-admin/receivables", superAdminAuth, async (req, res) => {
     }
 
     // D. Buscar Histórico de Repasses
+    const historySelectColumns = ["id", "amount", "received_at", "order_ids"];
+    if (hasValorRecebidoDetalhado) {
+      historySelectColumns.push("valorRecebidoDetalhado");
+    }
+
     const historyRows = await db("super_admin_receivables")
-      .select(
-        "id",
-        "amount",
-        "received_at",
-        "order_ids",
-        "valorRecebidoDetalhado",
-      )
+      .select(historySelectColumns)
       .orderBy("received_at", "desc")
       .limit(20);
 
