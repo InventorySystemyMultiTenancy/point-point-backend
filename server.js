@@ -38,9 +38,28 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
+const isAllowedVercelPreviewOrigin = (origin) => {
+  if (!origin) return false;
+
+  try {
+    const { hostname, protocol } = new URL(origin);
+    return (
+      protocol === "https:" &&
+      hostname.endsWith(".vercel.app") &&
+      hostname.startsWith("point-point-frontend")
+    );
+  } catch (e) {
+    return false;
+  }
+};
+
 const corsOptions = {
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (
+      !origin ||
+      allowedOrigins.includes(origin) ||
+      isAllowedVercelPreviewOrigin(origin)
+    ) {
       return callback(null, true);
     }
 
@@ -53,20 +72,7 @@ const corsOptions = {
 };
 
 // Configuração CORS para permitir frontend local e produção
-app.use(
-  cors({
-    origin: [
-      "http://localhost:3000",
-      "http://localhost:5173",
-      "https://point-point-frontend.vercel.app",
-      "https://primeplush.vercel.app",
-      "https://primeplush.com.br",
-    ],
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Super-Admin-Password"],
-    credentials: true,
-  }),
-);
+app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 // Centraliza as rotas de Super Admin
@@ -807,6 +813,7 @@ const secondaryAllowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
   "https://point-point-frontend.vercel.app",
+  "https://point-point-frontend-lo377nqek-gabriel-akiras-projects.vercel.app",
   "https://primeplush.com.br",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
@@ -816,7 +823,10 @@ app.use(
     origin: function (origin, callback) {
       // Permite requisições sem origin (apps móveis nativos)
       if (!origin) return callback(null, true);
-      if (secondaryAllowedOrigins.includes(origin)) {
+      if (
+        secondaryAllowedOrigins.includes(origin) ||
+        isAllowedVercelPreviewOrigin(origin)
+      ) {
         return callback(null, true);
       } else {
         console.warn(`CORS bloqueado para origem: ${origin}`);
