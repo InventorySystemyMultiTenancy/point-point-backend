@@ -8,6 +8,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
+    "build": "node --check server.js && node --check workers/cronJobs.js",
     "start": "node server.js",
     "dev": "node -r dotenv/config --watch server.js",
     "worker": "node workers/cronJobs.js",
