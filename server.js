@@ -235,6 +235,11 @@ const normalizeOutsourcedService = (service) => {
       service.fabric_paid_amount === undefined
         ? null
         : Number(service.fabric_paid_amount),
+    service_cost_amount:
+      service.service_cost_amount === null ||
+      service.service_cost_amount === undefined
+        ? null
+        : Number(service.service_cost_amount),
     expected_return_quantity: expectedReturn,
     total_delivered_quantity: totalDelivered,
     remaining_quantity: Math.max(0, expectedReturn - totalDelivered),
@@ -648,6 +653,20 @@ async function initDatabase() {
     console.log("Tabela 'stock_movements' criada com sucesso");
   }
 
+  if (!(await db.schema.hasTable("management_expenses"))) {
+    await db.schema.createTable("management_expenses", (table) => {
+      table.string("id").primary();
+      table.string("description").notNullable();
+      table.decimal("amount", 12, 2).notNullable();
+      table.string("category");
+      table.timestamp("expense_date").notNullable();
+      table.text("notes");
+      table.timestamp("created_at").defaultTo(db.fn.now());
+      table.timestamp("updated_at").defaultTo(db.fn.now());
+    });
+    console.log("Tabela 'management_expenses' criada com sucesso");
+  }
+
   if (!(await db.schema.hasTable("outsourced_companies"))) {
     await db.schema.createTable("outsourced_companies", (table) => {
       table.string("id").primary();
@@ -679,6 +698,7 @@ async function initDatabase() {
       table.decimal("input_quantity", 12, 3).notNullable();
       table.string("input_unit").notNullable();
       table.decimal("fabric_paid_amount", 12, 2);
+      table.decimal("service_cost_amount", 12, 2);
       table.decimal("expected_return_quantity", 12, 3).notNullable();
       table.string("expected_return_unit").notNullable();
       table.decimal("total_delivered_quantity", 12, 3).notNullable().defaultTo(0);
@@ -690,6 +710,17 @@ async function initDatabase() {
       table.timestamp("updated_at").defaultTo(db.fn.now());
     });
     console.log("Tabela 'outsourced_services' criada com sucesso");
+  } else {
+    const hasServiceCostAmount = await db.schema.hasColumn(
+      "outsourced_services",
+      "service_cost_amount",
+    );
+    if (!hasServiceCostAmount) {
+      await db.schema.table("outsourced_services", (table) => {
+        table.decimal("service_cost_amount", 12, 2);
+      });
+      console.log("Coluna service_cost_amount adicionada a outsourced_services");
+    }
   }
 
   if (!(await db.schema.hasTable("outsourced_service_deliveries"))) {
@@ -1097,6 +1128,157 @@ app.get(
 );
 
 app.get(
+  "/api/admin/management-expenses",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const query = db("management_expenses").select("*");
+      const startAt = toIsoDate(req.query.startAt);
+      const endAt = toIsoDate(req.query.endAt);
+
+      if (startAt) query.where("expense_date", ">=", startAt);
+      if (endAt) query.where("expense_date", "<=", endAt);
+
+      const expenses = await query.orderBy("expense_date", "desc");
+      res.json(
+        expenses.map((expense) => ({
+          ...expense,
+          amount: Number(expense.amount) || 0,
+        })),
+      );
+    } catch (e) {
+      console.error("Erro ao buscar gastos:", e);
+      res.status(500).json({ error: "Erro ao buscar gastos" });
+    }
+  },
+);
+
+app.post(
+  "/api/admin/management-expenses",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const description =
+        typeof req.body.description === "string"
+          ? req.body.description.trim()
+          : "";
+      const amount = toPositiveNumber(req.body.amount);
+      const expenseDate = toIsoDate(req.body.expense_date || req.body.date);
+
+      if (!description) {
+        return res.status(400).json({ error: "Descricao do gasto obrigatoria" });
+      }
+      if (!amount) {
+        return res
+          .status(400)
+          .json({ error: "Valor do gasto deve ser maior que zero" });
+      }
+      if (!expenseDate) {
+        return res.status(400).json({ error: "Data do gasto invalida" });
+      }
+
+      const now = new Date().toISOString();
+      const expense = {
+        id: req.body.id || `exp_${Date.now()}`,
+        description,
+        amount,
+        category: req.body.category || null,
+        expense_date: expenseDate,
+        notes: req.body.notes || null,
+        created_at: now,
+        updated_at: now,
+      };
+
+      await db("management_expenses").insert(expense);
+      res.status(201).json({ ...expense, amount: Number(expense.amount) });
+    } catch (e) {
+      console.error("Erro ao cadastrar gasto:", e);
+      res.status(500).json({ error: "Erro ao cadastrar gasto" });
+    }
+  },
+);
+
+app.put(
+  "/api/admin/management-expenses/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const exists = await db("management_expenses")
+        .where({ id: req.params.id })
+        .first();
+
+      if (!exists) {
+        return res.status(404).json({ error: "Gasto nao encontrado" });
+      }
+
+      const updates = { updated_at: new Date().toISOString() };
+      if (req.body.description !== undefined) {
+        const description = String(req.body.description).trim();
+        if (!description) {
+          return res
+            .status(400)
+            .json({ error: "Descricao do gasto obrigatoria" });
+        }
+        updates.description = description;
+      }
+      if (req.body.amount !== undefined) {
+        const amount = toPositiveNumber(req.body.amount);
+        if (!amount) {
+          return res
+            .status(400)
+            .json({ error: "Valor do gasto deve ser maior que zero" });
+        }
+        updates.amount = amount;
+      }
+      if (req.body.expense_date !== undefined || req.body.date !== undefined) {
+        const expenseDate = toIsoDate(req.body.expense_date || req.body.date);
+        if (!expenseDate) {
+          return res.status(400).json({ error: "Data do gasto invalida" });
+        }
+        updates.expense_date = expenseDate;
+      }
+      if (req.body.category !== undefined) updates.category = req.body.category;
+      if (req.body.notes !== undefined) updates.notes = req.body.notes;
+
+      await db("management_expenses").where({ id: req.params.id }).update(updates);
+      const updated = await db("management_expenses")
+        .where({ id: req.params.id })
+        .first();
+
+      res.json({ ...updated, amount: Number(updated.amount) || 0 });
+    } catch (e) {
+      console.error("Erro ao atualizar gasto:", e);
+      res.status(500).json({ error: "Erro ao atualizar gasto" });
+    }
+  },
+);
+
+app.delete(
+  "/api/admin/management-expenses/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const deleted = await db("management_expenses")
+        .where({ id: req.params.id })
+        .del();
+
+      if (!deleted) {
+        return res.status(404).json({ error: "Gasto nao encontrado" });
+      }
+
+      res.json({ success: true });
+    } catch (e) {
+      console.error("Erro ao excluir gasto:", e);
+      res.status(500).json({ error: "Erro ao excluir gasto" });
+    }
+  },
+);
+
+app.get(
   "/api/admin/outsourced-services/types",
   authenticateToken,
   authorizeAdmin,
@@ -1322,6 +1504,7 @@ app.post(
       );
       const dueDate = toIsoDate(req.body.due_date);
       const fabricPaidAmount = toNumberOrNull(req.body.fabric_paid_amount);
+      const serviceCostAmount = toNumberOrNull(req.body.service_cost_amount);
 
       if (!inputQuantity) {
         return res
@@ -1341,6 +1524,11 @@ app.post(
           .status(400)
           .json({ error: "Valor pago pelo tecido nao pode ser negativo" });
       }
+      if (serviceCostAmount !== null && serviceCostAmount < 0) {
+        return res
+          .status(400)
+          .json({ error: "Valor cobrado pelo servico nao pode ser negativo" });
+      }
 
       const now = new Date().toISOString();
       const service = {
@@ -1351,6 +1539,7 @@ app.post(
         input_quantity: inputQuantity,
         input_unit: typeConfig.inputUnit,
         fabric_paid_amount: fabricPaidAmount,
+        service_cost_amount: serviceCostAmount,
         expected_return_quantity: expectedReturnQuantity,
         expected_return_unit: typeConfig.outputUnit,
         total_delivered_quantity: 0,
@@ -1541,12 +1730,12 @@ app.get(
         return query;
       };
 
-      const applyReceivableDateRange = (query) => {
+      const applyDateRange = (query, columnName) => {
         if (startAt) {
-          query.where("received_at", ">=", startAt);
+          query.where(columnName, ">=", startAt);
         }
         if (endAt) {
-          query.where("received_at", "<=", endAt);
+          query.where(columnName, "<=", endAt);
         }
         return query;
       };
@@ -1655,9 +1844,7 @@ app.get(
         map.set(key, current);
       };
 
-      const receivablesRows = await db("super_admin_receivables").select(
-        "order_ids",
-      );
+      const receivablesRows = [];
       const alreadyProcessedIds = [];
 
       receivablesRows.forEach((row) => {
@@ -1712,12 +1899,6 @@ app.get(
             "status",
             "paymentType",
           ),
-      );
-
-      const processedOrderIdsSet = new Set(alreadyProcessedIds);
-
-      const pendingPaidOrders = paidOrders.filter(
-        (order) => !processedOrderIdsSet.has(String(order.id)),
       );
 
       const productRows = await db("products").select(
@@ -1787,23 +1968,6 @@ app.get(
         const meta = productMetaMap.get(String(prodId));
         return meta ? meta.unitCost : 0;
       };
-
-      const calculateOrderValueToReceive = (orderItems) => {
-        let orderValue = 0;
-        orderItems.forEach((item) => {
-          const quantity = Number(item.quantity) || 1;
-          const salePrice = Number(item.price) || 0;
-          const unitCost = getUnitCostByItem(item);
-          orderValue += (salePrice - unitCost) * quantity;
-        });
-        return orderValue;
-      };
-
-      const totalToPayGiraKids = pendingPaidOrders.reduce((sum, order) => {
-        const parsedItems = parseJSON(order.items);
-        const orderItems = Array.isArray(parsedItems) ? parsedItems : [];
-        return sum + calculateOrderValueToReceive(orderItems);
-      }, 0);
 
       const successfulOrdersCount =
         ordersInRange.filter(isSuccessfulOrder).length;
@@ -1883,7 +2047,7 @@ app.get(
           const unitCost = getUnitCostByItem(item);
 
           const itemRevenue = salePrice * quantity;
-          const itemValueToReceive = (salePrice - unitCost) * quantity;
+          const grossProfit = (salePrice - unitCost) * quantity;
 
           totalItemsSold += quantity;
 
@@ -1893,14 +2057,14 @@ app.get(
             category: itemCategory,
             quantitySold: 0,
             revenue: 0,
-            giraKidsValue: 0,
+            grossProfit: 0,
             stock: itemMeta?.stock ?? null,
             minStock: itemMeta?.minStock || 0,
           };
 
           existing.quantitySold += quantity;
           existing.revenue += itemRevenue;
-          existing.giraKidsValue += itemValueToReceive;
+          existing.grossProfit += grossProfit;
 
           productSales.set(itemId, existing);
 
@@ -1916,14 +2080,45 @@ app.get(
         });
       });
 
-      const totalPaidRow = await applyReceivableDateRange(
-        db("super_admin_receivables"),
-      )
-        .sum("amount as total")
-        .first();
+      const outsourcedFinancialRows = await applyDateRange(
+        db("outsourced_services").select(
+          "id",
+          "service_type",
+          "fabric_paid_amount",
+          "service_cost_amount",
+          "started_at",
+          "created_at",
+        ),
+        "started_at",
+      );
+      const expensesRows = await applyDateRange(
+        db("management_expenses").select(
+          "id",
+          "description",
+          "amount",
+          "category",
+          "expense_date",
+        ),
+        "expense_date",
+      );
 
-      const totalPaidToGiraKids = parseFloat(totalPaidRow?.total) || 0;
-      const pendingToPay = Math.max(0, totalToPayGiraKids);
+      const outsourcedMaterialRevenue = outsourcedFinancialRows.reduce(
+        (sum, service) => sum + (Number(service.fabric_paid_amount) || 0),
+        0,
+      );
+      const outsourcedServiceCosts = outsourcedFinancialRows.reduce(
+        (sum, service) => sum + (Number(service.service_cost_amount) || 0),
+        0,
+      );
+      const registeredExpensesTotal = expensesRows.reduce(
+        (sum, expense) => sum + (Number(expense.amount) || 0),
+        0,
+      );
+      const ecommerceGrossRevenue = totalRevenue;
+      const grossRevenue = ecommerceGrossRevenue + outsourcedMaterialRevenue;
+      const netProfit =
+        grossRevenue - outsourcedServiceCosts - registeredExpensesTotal;
+
       const averageTicket = successfulOrdersCount
         ? totalRevenue / successfulOrdersCount
         : 0;
@@ -1944,7 +2139,7 @@ app.get(
         .map((product) => ({
           ...product,
           revenue: Number(product.revenue.toFixed(2)),
-          giraKidsValue: Number(product.giraKidsValue.toFixed(2)),
+          grossProfit: Number(product.grossProfit.toFixed(2)),
           stock:
             product.stock === null || product.stock === undefined
               ? null
@@ -2131,16 +2326,38 @@ app.get(
           canceledOrders: canceledOrdersCount,
           pendingOrders: pendingOrdersCount,
           totalItemsSold,
-          totalRevenue: Number(totalRevenue.toFixed(2)),
+          ecommerceGrossRevenue: Number(ecommerceGrossRevenue.toFixed(2)),
+          outsourcedMaterialRevenue: Number(
+            outsourcedMaterialRevenue.toFixed(2),
+          ),
+          grossRevenue: Number(grossRevenue.toFixed(2)),
+          outsourcedServiceCosts: Number(outsourcedServiceCosts.toFixed(2)),
+          registeredExpenses: Number(registeredExpensesTotal.toFixed(2)),
+          netProfit: Number(netProfit.toFixed(2)),
+          totalRevenue: Number(grossRevenue.toFixed(2)),
           averageTicket: Number(averageTicket.toFixed(2)),
           successRate: Number(successRate.toFixed(2)),
           cancellationRate: Number(cancellationRate.toFixed(2)),
           pendingRate: Number(pendingRate.toFixed(2)),
-          totalToPayGiraKids: Number(pendingToPay.toFixed(2)),
-          totalPaidToGiraKids: Number(totalPaidToGiraKids.toFixed(2)),
-          totalGiraKidsAccrued: Number(
-            (pendingToPay + totalPaidToGiraKids).toFixed(2),
+        },
+        finance: {
+          ecommerceGrossRevenue: Number(ecommerceGrossRevenue.toFixed(2)),
+          outsourcedMaterialRevenue: Number(
+            outsourcedMaterialRevenue.toFixed(2),
           ),
+          grossRevenue: Number(grossRevenue.toFixed(2)),
+          outsourcedServiceCosts: Number(outsourcedServiceCosts.toFixed(2)),
+          registeredExpenses: Number(registeredExpensesTotal.toFixed(2)),
+          netProfit: Number(netProfit.toFixed(2)),
+          outsourcedServices: outsourcedFinancialRows.map((service) => ({
+            ...service,
+            fabric_paid_amount: Number(service.fabric_paid_amount) || 0,
+            service_cost_amount: Number(service.service_cost_amount) || 0,
+          })),
+          expenses: expensesRows.map((expense) => ({
+            ...expense,
+            amount: Number(expense.amount) || 0,
+          })),
         },
         products,
         charts: {
