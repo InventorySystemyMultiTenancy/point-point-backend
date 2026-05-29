@@ -440,6 +440,7 @@ async function initDatabase() {
       table.boolean("popular").defaultTo(false);
       table.integer("stock"); // NULL = estoque ilimitado, 0 = esgotado
       table.integer("stock_reserved").defaultTo(0); // Estoque reservado temporariamente
+      table.boolean("active").notNullable().defaultTo(true);
       table.integer("minStock").defaultTo(0); // Estoque mínimo
     });
     // Adiciona coluna imageUrl se não existir
@@ -506,6 +507,13 @@ async function initDatabase() {
       });
       console.log("✅ Coluna images adicionada à tabela products");
     }
+    const hasProductActive = await db.schema.hasColumn("products", "active");
+    if (!hasProductActive) {
+      await db.schema.table("products", (table) => {
+        table.boolean("active").notNullable().defaultTo(true);
+      });
+      console.log("Coluna active adicionada a tabela products");
+    }
   }
 
   const hasUsers = await db.schema.hasTable("users");
@@ -515,9 +523,32 @@ async function initDatabase() {
       table.string("name").notNullable();
       table.string("email").unique();
       table.string("cpf").unique();
+      table.string("password");
+      table.string("role").defaultTo("customer");
+      table.string("cep");
+      table.text("address");
+      table.string("phone");
       table.json("historico").defaultTo("[]");
       table.integer("pontos").defaultTo(0);
     });
+  }
+
+  const userOptionalColumns = [
+    { name: "password", type: "string" },
+    { name: "role", type: "string" },
+    { name: "cep", type: "string" },
+    { name: "address", type: "text" },
+    { name: "phone", type: "string" },
+  ];
+  for (const col of userOptionalColumns) {
+    const hasCol = await db.schema.hasColumn("users", col.name);
+    if (!hasCol) {
+      await db.schema.table("users", (table) => {
+        if (col.type === "string") table.string(col.name);
+        if (col.type === "text") table.text(col.name);
+      });
+      console.log(`Coluna '${col.name}' adicionada a tabela users`);
+    }
   }
 
   const hasOrders = await db.schema.hasTable("orders");
@@ -599,6 +630,24 @@ async function initDatabase() {
   }
 
   // Modo single-tenant: não cria tabela de lojas
+  if (!(await db.schema.hasTable("stock_movements"))) {
+    await db.schema.createTable("stock_movements", (table) => {
+      table.string("id").primary();
+      table
+        .string("product_id")
+        .references("id")
+        .inTable("products")
+        .onDelete("SET NULL");
+      table.string("product_name");
+      table.string("type").notNullable();
+      table.integer("quantity").notNullable();
+      table.text("reason");
+      table.string("created_by");
+      table.timestamp("created_at").defaultTo(db.fn.now());
+    });
+    console.log("Tabela 'stock_movements' criada com sucesso");
+  }
+
   if (!(await db.schema.hasTable("outsourced_companies"))) {
     await db.schema.createTable("outsourced_companies", (table) => {
       table.string("id").primary();
@@ -765,10 +814,18 @@ async function initDatabase() {
         return res.status(401).json({ error: "Senha incorreta" });
       }
 
+      const normalizedRole = user.role || "customer";
+      const token =
+        JWT_SECRET && normalizedRole === "admin"
+          ? jwt.sign({ role: "admin" }, JWT_SECRET, { expiresIn: "8h" })
+          : null;
+
       res.json({
         success: true,
+        token,
         user: {
           ...user,
+          role: normalizedRole,
           historico:
             typeof user.historico === "string"
               ? JSON.parse(user.historico)
@@ -1014,6 +1071,30 @@ const authorizeKitchen = (req, res, next) => {
   }
   next();
 };
+
+app.get(
+  "/api/admin/stock-movements",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const movements = await db("stock_movements")
+        .select("*")
+        .orderBy("created_at", "desc")
+        .limit(200);
+
+      res.json(
+        movements.map((movement) => ({
+          ...movement,
+          quantity: Number(movement.quantity) || 0,
+        })),
+      );
+    } catch (e) {
+      console.error("Erro ao buscar movimentacoes de estoque:", e);
+      res.status(500).json({ error: "Erro ao buscar movimentacoes de estoque" });
+    }
+  },
+);
 
 app.get(
   "/api/admin/outsourced-services/types",
