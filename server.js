@@ -349,7 +349,9 @@ async function initDatabase() {
     { name: "installments", type: "integer" },
     { name: "fee", type: "decimal" },
   ];
-  for (const col of paymentCols) {
+  const hasOrdersForPaymentCols = await db.schema.hasTable("orders");
+  if (hasOrdersForPaymentCols) {
+    for (const col of paymentCols) {
     const hasCol = await db.schema.hasColumn("orders", col.name);
     if (!hasCol) {
       await db.schema.table("orders", (table) => {
@@ -361,6 +363,8 @@ async function initDatabase() {
     }
   }
   console.log("⏳ Verificando tabelas...");
+
+  }
 
   // ========== TABELA DE RECEBIMENTOS DO SUPER ADMIN ==========
   const hasReceivables = await db.schema.hasTable("super_admin_receivables");
@@ -497,6 +501,10 @@ async function initDatabase() {
       table.string("status").defaultTo("active");
       table.string("paymentStatus").defaultTo("pending");
       table.string("paymentId");
+      table.string("paymentType");
+      table.string("paymentMethod");
+      table.integer("installments");
+      table.decimal("fee", 8, 2);
       table.json("items").notNullable();
       table.timestamp("completedAt");
       table.boolean("hiddenFromHistory").defaultTo(false);
