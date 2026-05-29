@@ -29,17 +29,45 @@ import superAdminRoutes from "./routes/superadmin.js";
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "https://point-point-frontend.vercel.app",
+  "https://primeplush.vercel.app",
+  "https://primeplush.com.br",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    console.warn(`CORS bloqueado para origem: ${origin}`);
+    return callback(new Error(`CORS bloqueado para origin: ${origin}`));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Super-Admin-Password"],
+  credentials: true,
+};
+
 // Configuração CORS para permitir frontend local e produção
 app.use(
   cors({
     origin: [
       "http://localhost:3000",
+      "http://localhost:5173",
+      "https://point-point-frontend.vercel.app",
       "https://primeplush.vercel.app",
       "https://primeplush.com.br",
     ],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Super-Admin-Password"],
     credentials: true,
   }),
 );
+app.options("*", cors(corsOptions));
 
 // Centraliza as rotas de Super Admin
 app.use("/api", superAdminRoutes);
@@ -775,8 +803,10 @@ async function initDatabase() {
 
 // Permissões CORS para web e apps móveis (Capacitor)
 
-const allowedOrigins = [
+const secondaryAllowedOrigins = [
   "http://localhost:3000",
+  "http://localhost:5173",
+  "https://point-point-frontend.vercel.app",
   "https://primeplush.com.br",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
@@ -786,14 +816,15 @@ app.use(
     origin: function (origin, callback) {
       // Permite requisições sem origin (apps móveis nativos)
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) {
+      if (secondaryAllowedOrigins.includes(origin)) {
         return callback(null, true);
       } else {
         console.warn(`CORS bloqueado para origem: ${origin}`);
         return callback(new Error("Not allowed by CORS"));
       }
     },
-    methods: ["GET", "POST", "DELETE", "PUT", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Super-Admin-Password"],
     credentials: true,
   }),
 );
