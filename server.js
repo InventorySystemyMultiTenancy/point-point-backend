@@ -2087,8 +2087,6 @@ app.get(
 
 app.get(
   "/api/products",
-  authenticateToken,
-  authorizeAdmin,
   async (req, res) => {
     try {
       const products = await db("products").select("*").orderBy("id");
