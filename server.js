@@ -201,6 +201,18 @@ const normalizeOutsourcedCompany = (company) =>
       }
     : null;
 
+const normalizeEmployeeAccess = (employee) =>
+  employee
+    ? {
+        id: employee.id,
+        name: employee.name,
+        username: employee.username,
+        active: !!employee.active,
+        created_at: employee.created_at,
+        updated_at: employee.updated_at,
+      }
+    : null;
+
 const getOutsourcedServiceStatus = (service) => {
   if (service.status === "concluido") return "concluido";
   const delivered = Number(service.total_delivered_quantity) || 0;
@@ -697,6 +709,20 @@ async function initDatabase() {
     console.log("Tabela 'management_expenses' criada com sucesso");
   }
 
+  if (!(await db.schema.hasTable("employee_accesses"))) {
+    await db.schema.createTable("employee_accesses", (table) => {
+      table.string("id").primary();
+      table.string("name").notNullable();
+      table.string("username").notNullable().unique();
+      table.string("password").notNullable();
+      table.boolean("active").notNullable().defaultTo(true);
+      table.string("created_by");
+      table.timestamp("created_at").defaultTo(db.fn.now());
+      table.timestamp("updated_at").defaultTo(db.fn.now());
+    });
+    console.log("Tabela 'employee_accesses' criada com sucesso");
+  }
+
   if (!(await db.schema.hasTable("outsourced_companies"))) {
     await db.schema.createTable("outsourced_companies", (table) => {
       table.string("id").primary();
@@ -992,13 +1018,63 @@ app.get("/api/webhooks/mercadopago", (req, res) => {
 });
 
 // --- Rota de Autenticação Segura ---
-app.post("/api/auth/login", (req, res) => {
-  const { role, password } = req.body;
+app.post("/api/auth/login", async (req, res) => {
+  const { role, password, username } = req.body;
 
   if (!role || !password) {
     return res
       .status(400)
       .json({ success: false, message: "Role e senha são obrigatórios" });
+  }
+
+  if (role === "employee") {
+    if (!username) {
+      return res.status(400).json({
+        success: false,
+        message: "Usuario e senha sao obrigatorios para funcionario",
+      });
+    }
+
+    if (!JWT_SECRET) {
+      console.error("JWT_SECRET nao configurado para login de funcionario");
+      return res
+        .status(500)
+        .json({ success: false, message: "Erro de configuracao no servidor." });
+    }
+
+    try {
+      const employee = await db("employee_accesses")
+        .where({ username: String(username).trim(), active: true })
+        .first();
+
+      if (!employee || employee.password !== password) {
+        return res
+          .status(401)
+          .json({ success: false, message: "Usuario ou senha invalidos" });
+      }
+
+      const token = jwt.sign(
+        {
+          role: "employee",
+          employeeId: employee.id,
+          name: employee.name,
+        },
+        JWT_SECRET,
+        { expiresIn: "8h" },
+      );
+
+      return res.json({
+        success: true,
+        token,
+        user: normalizeEmployeeAccess(employee),
+      });
+    } catch (error) {
+      console.error("Erro no login de funcionario:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Erro ao autenticar funcionario",
+      });
+    }
   }
 
   let correctPassword;
@@ -1124,6 +1200,47 @@ const authorizeAdmin = (req, res, next) => {
   next();
 };
 
+const authorizeOutsourcedAccess = (req, res, next) => {
+  if (
+    req.user.role !== "employee" &&
+    req.user.role !== "admin" &&
+    req.user.role !== "superadmin"
+  ) {
+    return res.status(403).json({
+      error:
+        "Acesso negado. Requer permissao de funcionario, administrador ou superadmin.",
+    });
+  }
+  next();
+};
+
+const authorizeSuperAdminAccess = (req, res, next) => {
+  const password = req.headers["x-super-admin-password"];
+  if (password && password === SUPER_ADMIN_PASSWORD) {
+    return next();
+  }
+
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res
+      .status(401)
+      .json({ error: "Acesso negado. Credencial de superadmin ausente." });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err || user.role !== "superadmin") {
+      return res
+        .status(403)
+        .json({ error: "Acesso negado. Requer superadmin." });
+    }
+
+    req.user = user;
+    next();
+  });
+};
+
 const authorizeKitchen = (req, res, next) => {
   if (req.user.role !== "kitchen" && req.user.role !== "admin") {
     return res.status(403).json({
@@ -1132,6 +1249,141 @@ const authorizeKitchen = (req, res, next) => {
   }
   next();
 };
+
+app.get(
+  "/api/super-admin/employees",
+  authorizeSuperAdminAccess,
+  async (req, res) => {
+    try {
+      const employees = await db("employee_accesses")
+        .select("id", "name", "username", "active", "created_at", "updated_at")
+        .orderBy("created_at", "desc");
+
+      res.json(employees.map(normalizeEmployeeAccess));
+    } catch (e) {
+      console.error("Erro ao buscar acessos de funcionarios:", e);
+      res.status(500).json({ error: "Erro ao buscar funcionarios" });
+    }
+  },
+);
+
+app.post(
+  "/api/super-admin/employees",
+  authorizeSuperAdminAccess,
+  async (req, res) => {
+    try {
+      const name = typeof req.body.name === "string" ? req.body.name.trim() : "";
+      const username =
+        typeof req.body.username === "string" ? req.body.username.trim() : "";
+      const password =
+        typeof req.body.password === "string" ? req.body.password : "";
+
+      if (!name || !username || !password) {
+        return res.status(400).json({
+          error: "Nome, usuario e senha do funcionario sao obrigatorios",
+        });
+      }
+
+      const existing = await db("employee_accesses").where({ username }).first();
+      if (existing) {
+        return res.status(409).json({ error: "Usuario ja cadastrado" });
+      }
+
+      const now = new Date().toISOString();
+      const employee = {
+        id: req.body.id || `emp_${Date.now()}`,
+        name,
+        username,
+        password,
+        active: req.body.active === undefined ? true : !!req.body.active,
+        created_by: req.user?.role || "superadmin",
+        created_at: now,
+        updated_at: now,
+      };
+
+      await db("employee_accesses").insert(employee);
+      res.status(201).json(normalizeEmployeeAccess(employee));
+    } catch (e) {
+      console.error("Erro ao criar acesso de funcionario:", e);
+      res.status(500).json({ error: "Erro ao criar funcionario" });
+    }
+  },
+);
+
+app.put(
+  "/api/super-admin/employees/:id",
+  authorizeSuperAdminAccess,
+  async (req, res) => {
+    try {
+      const employee = await db("employee_accesses")
+        .where({ id: req.params.id })
+        .first();
+
+      if (!employee) {
+        return res.status(404).json({ error: "Funcionario nao encontrado" });
+      }
+
+      const updates = { updated_at: new Date().toISOString() };
+      if (req.body.name !== undefined) {
+        const name = String(req.body.name).trim();
+        if (!name) return res.status(400).json({ error: "Nome obrigatorio" });
+        updates.name = name;
+      }
+      if (req.body.username !== undefined) {
+        const username = String(req.body.username).trim();
+        if (!username) {
+          return res.status(400).json({ error: "Usuario obrigatorio" });
+        }
+        const duplicate = await db("employee_accesses")
+          .where({ username })
+          .whereNot({ id: req.params.id })
+          .first();
+        if (duplicate) {
+          return res.status(409).json({ error: "Usuario ja cadastrado" });
+        }
+        updates.username = username;
+      }
+      if (req.body.password !== undefined) {
+        if (!String(req.body.password)) {
+          return res.status(400).json({ error: "Senha obrigatoria" });
+        }
+        updates.password = String(req.body.password);
+      }
+      if (req.body.active !== undefined) updates.active = !!req.body.active;
+
+      await db("employee_accesses").where({ id: req.params.id }).update(updates);
+      const updated = await db("employee_accesses")
+        .where({ id: req.params.id })
+        .first();
+
+      res.json(normalizeEmployeeAccess(updated));
+    } catch (e) {
+      console.error("Erro ao atualizar acesso de funcionario:", e);
+      res.status(500).json({ error: "Erro ao atualizar funcionario" });
+    }
+  },
+);
+
+app.delete(
+  "/api/super-admin/employees/:id",
+  authorizeSuperAdminAccess,
+  async (req, res) => {
+    try {
+      const deleted = await db("employee_accesses")
+        .where({ id: req.params.id })
+        .del();
+
+      if (!deleted) {
+        return res.status(404).json({ error: "Funcionario nao encontrado" });
+      }
+
+      res.json({ success: true });
+    } catch (e) {
+      console.error("Erro ao excluir acesso de funcionario:", e);
+      res.status(500).json({ error: "Erro ao excluir funcionario" });
+    }
+  },
+);
 
 app.get(
   "/api/admin/stock-movements",
@@ -1311,7 +1563,7 @@ app.delete(
 app.get(
   "/api/admin/outsourced-services/types",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     res.json({
       types: Object.entries(OUTSOURCED_SERVICE_TYPES).map(([value, config]) => ({
@@ -1325,7 +1577,7 @@ app.get(
 app.get(
   "/api/admin/outsourced-companies",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const includeInactive = req.query.includeInactive === "true";
@@ -1345,7 +1597,7 @@ app.get(
 app.post(
   "/api/admin/outsourced-companies",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const name = typeof req.body.name === "string" ? req.body.name.trim() : "";
@@ -1380,7 +1632,7 @@ app.post(
 app.put(
   "/api/admin/outsourced-companies/:id",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -1422,7 +1674,7 @@ app.put(
 app.get(
   "/api/admin/outsourced-services",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const { status, companyId, overdue } = req.query;
@@ -1451,7 +1703,7 @@ app.get(
 app.get(
   "/api/admin/outsourced-services/alerts",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const services = await db("outsourced_services as s")
@@ -1475,7 +1727,7 @@ app.get(
 app.get(
   "/api/admin/outsourced-services/:id",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const service = await db("outsourced_services as s")
@@ -1509,7 +1761,7 @@ app.get(
 app.post(
   "/api/admin/outsourced-services",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const companyId = req.body.company_id || req.body.companyId;
@@ -1598,7 +1850,7 @@ app.post(
 app.post(
   "/api/admin/outsourced-services/:id/deliveries",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const service = await db("outsourced_services")
@@ -1674,7 +1926,7 @@ app.post(
 app.put(
   "/api/admin/outsourced-services/:id/finalize",
   authenticateToken,
-  authorizeAdmin,
+  authorizeOutsourcedAccess,
   async (req, res) => {
     try {
       const service = await db("outsourced_services")
