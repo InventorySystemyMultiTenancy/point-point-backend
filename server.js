@@ -188,6 +188,64 @@ const getBackorderMeta = (product, quantity = 1) => {
 const isTruthyDb = (value) =>
   value === true || value === 1 || value === "1" || value === "true";
 
+const IMPORTED_CATEGORY_NAME = "importados";
+
+const normalizeCategoryName = (category) =>
+  String(category || "").trim().toLowerCase();
+
+const isImportedProduct = (product) =>
+  normalizeCategoryName(product?.category) === IMPORTED_CATEGORY_NAME;
+
+const filterCatalogProducts = (products, hasFullAccess = false) =>
+  hasFullAccess ? products : products.filter((product) => !isImportedProduct(product));
+
+const getBearerToken = (req) => {
+  const authHeader = req.headers["authorization"];
+  return authHeader && authHeader.startsWith("Bearer ")
+    ? authHeader.split(" ")[1]
+    : null;
+};
+
+const hasAdminCatalogAccess = (req) => {
+  const token = getBearerToken(req);
+  if (!token || !JWT_SECRET) return false;
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    return payload?.role === "admin" || payload?.role === "superadmin";
+  } catch (e) {
+    return false;
+  }
+};
+
+const userHasFullAccess = (user) => isTruthyDb(user?.fullAccess);
+
+const resolveCatalogFullAccess = async (req) => {
+  if (hasAdminCatalogAccess(req)) return true;
+
+  const token = getBearerToken(req);
+  let tokenUserId = null;
+  if (token && JWT_SECRET) {
+    try {
+      tokenUserId = jwt.verify(token, JWT_SECRET)?.userId;
+    } catch (e) {
+      tokenUserId = null;
+    }
+  }
+
+  const userId = tokenUserId || req.query.userId || req.headers["x-user-id"];
+  if (!userId) return false;
+
+  const user = await db("users").where({ id: String(userId) }).first();
+  return userHasFullAccess(user);
+};
+
+const normalizeUserResponse = (user) => ({
+  ...user,
+  historico: parseJSON(user?.historico),
+  fullAccess: userHasFullAccess(user),
+});
+
 const getItemProductId = (item) => item?.id || item?.productId || item?.product_id;
 
 const adjustStockForOrderItems = async (query, items, direction = -1) => {
@@ -674,6 +732,7 @@ async function initDatabase() {
       table.string("phone");
       table.json("historico").defaultTo("[]");
       table.integer("pontos").defaultTo(0);
+      table.boolean("fullAccess").notNullable().defaultTo(false);
     });
   }
 
@@ -683,6 +742,7 @@ async function initDatabase() {
     { name: "cep", type: "string" },
     { name: "address", type: "text" },
     { name: "phone", type: "string" },
+    { name: "fullAccess", type: "boolean" },
   ];
   for (const col of userOptionalColumns) {
     const hasCol = await db.schema.hasColumn("users", col.name);
@@ -690,6 +750,9 @@ async function initDatabase() {
       await db.schema.table("users", (table) => {
         if (col.type === "string") table.string(col.name);
         if (col.type === "text") table.text(col.name);
+        if (col.type === "boolean") {
+          table.boolean(col.name).notNullable().defaultTo(false);
+        }
       });
       console.log(`Coluna '${col.name}' adicionada a tabela users`);
     }
@@ -1096,22 +1159,21 @@ async function initDatabase() {
       }
 
       const normalizedRole = user.role || "customer";
-      const token =
-        JWT_SECRET && normalizedRole === "admin"
-          ? jwt.sign({ role: "admin" }, JWT_SECRET, { expiresIn: "8h" })
-          : null;
+      const token = JWT_SECRET
+        ? jwt.sign(
+            { role: normalizedRole, userId: user.id },
+            JWT_SECRET,
+            { expiresIn: "8h" },
+          )
+        : null;
 
       res.json({
         success: true,
         token,
-        user: {
+        user: normalizeUserResponse({
           ...user,
           role: normalizedRole,
-          historico:
-            typeof user.historico === "string"
-              ? JSON.parse(user.historico)
-              : user.historico,
-        },
+        }),
       });
     } catch (e) {
       console.error("❌ Erro ao autenticar usuário:", e);
@@ -1316,16 +1378,18 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/menu", async (req, res) => {
   try {
+    const hasFullAccess = await resolveCatalogFullAccess(req);
     // SINGLE-TENANT: Retorna todos os produtos
     const products = await db("products")
       .select("*")
       .where({ active: true })
       .orderBy("id");
+    const visibleProducts = filterCatalogProducts(products, hasFullAccess);
     console.log(
       `✅ [GET /api/menu] Retornando ${products.length} produtos (single-tenant)`,
     );
 
-    res.json(products.map(normalizeProductResponse));
+    res.json(visibleProducts.map(normalizeProductResponse));
   } catch (e) {
     console.error(`❌ [GET /api/menu] ERRO ao buscar menu:`, e.message);
     console.error(`❌ [GET /api/menu] Stack:`, e.stack);
@@ -2906,8 +2970,10 @@ app.get(
   "/api/products",
   async (req, res) => {
     try {
+      const hasFullAccess = await resolveCatalogFullAccess(req);
       const products = await db("products").select("*").orderBy("id");
-      res.json(products.map(normalizeProductResponse));
+      const visibleProducts = filterCatalogProducts(products, hasFullAccess);
+      res.json(visibleProducts.map(normalizeProductResponse));
     } catch (e) {
       console.error("Erro ao buscar todos os produtos:", e);
       res.status(500).json({ error: "Erro ao buscar produtos" });
@@ -3080,11 +3146,17 @@ app.delete(
 // Listar categorias
 app.get("/api/categories", async (req, res) => {
   try {
+    const hasFullAccess = await resolveCatalogFullAccess(req);
     const categories = await db("categories")
       .select("id", "name", "icon", "order", "created_at")
       .orderBy("order", "asc")
       .orderBy("name", "asc");
-    res.json(categories);
+    const visibleCategories = hasFullAccess
+      ? categories
+      : categories.filter(
+          (category) => normalizeCategoryName(category.name) !== IMPORTED_CATEGORY_NAME,
+        );
+    res.json(visibleCategories);
   } catch (e) {
     console.error("❌ Erro ao buscar categorias:", e);
     res.status(500).json({ error: "Erro ao buscar categorias" });
@@ -3203,7 +3275,7 @@ app.post("/api/users/check-cpf", async (req, res) => {
     }
     const user = await db("users").where({ cpf: docClean }).first();
     if (user) {
-      return res.json({ exists: true, user });
+      return res.json({ exists: true, user: normalizeUserResponse(user) });
     } else {
       return res.json({ exists: false, requiresRegistration: true });
     }
@@ -3231,10 +3303,7 @@ app.get("/api/users/cpf/:cpf", async (req, res) => {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
 
-    res.json({
-      ...user,
-      historico: parseJSON(user.historico),
-    });
+    res.json(normalizeUserResponse(user));
   } catch (e) {
     console.error("❌ Erro ao buscar usuário por documento:", e);
     res.status(500).json({ error: "Erro ao buscar usuário" });
@@ -3246,10 +3315,7 @@ app.get("/api/users", authenticateToken, authorizeAdmin, async (req, res) => {
     const users = await db("users").select("*");
 
     // Mapeia os usuários garantindo que o histórico seja sempre um objeto/array válido
-    const formattedUsers = users.map((u) => ({
-      ...u,
-      historico: parseJSON(u.historico),
-    }));
+    const formattedUsers = users.map(normalizeUserResponse);
 
     res.json(formattedUsers);
   } catch (e) {
@@ -3257,6 +3323,40 @@ app.get("/api/users", authenticateToken, authorizeAdmin, async (req, res) => {
     res.status(500).json({ error: "Erro ao buscar usuários" });
   }
 });
+
+app.patch(
+  "/api/users/:id/full-access",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+    const { fullAccess } = req.body;
+
+    if (typeof fullAccess === "undefined") {
+      return res.status(400).json({ error: "fullAccess é obrigatório" });
+    }
+
+    try {
+      const user = await db("users").where({ id }).first();
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
+
+      await db("users").where({ id }).update({
+        fullAccess: isTruthyDb(fullAccess),
+      });
+
+      const updatedUser = await db("users").where({ id }).first();
+      res.json({
+        success: true,
+        user: normalizeUserResponse(updatedUser),
+      });
+    } catch (e) {
+      console.error("Erro ao atualizar acesso completo:", e);
+      res.status(500).json({ error: "Erro ao atualizar acesso completo" });
+    }
+  },
+);
 
 // Endpoint para listar todos os produtos (admin)
 app.get(
@@ -3327,10 +3427,7 @@ app.post("/api/users/register", async (req, res) => {
       console.log(`⚠️ Tentativa de cadastro duplicado: ${docClean}`);
       return res.status(409).json({
         error: "Este documento já está cadastrado",
-        user: {
-          ...exists,
-          historico: parseJSON(exists.historico),
-        },
+        user: normalizeUserResponse(exists),
       });
     }
 
@@ -3349,6 +3446,7 @@ app.post("/api/users/register", async (req, res) => {
       historico: JSON.stringify([]),
       pontos: 0,
       role: "customer",
+      fullAccess: false,
     };
 
     await db("users").insert(newUser);
@@ -3357,10 +3455,7 @@ app.post("/api/users/register", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      user: {
-        ...newUser,
-        historico: [],
-      },
+      user: normalizeUserResponse(newUser),
     });
   } catch (e) {
     console.error("❌ Erro ao cadastrar usuário:", e);
@@ -3392,8 +3487,7 @@ app.post("/api/users", async (req, res) => {
         `ℹ️ Documento ${docClean} já cadastrado - retornando usuário existente`,
       );
       return res.json({
-        ...exists,
-        historico: parseJSON(exists.historico),
+        ...normalizeUserResponse(exists),
         message: "Usuário já existe - login realizado",
       });
     }
@@ -3407,12 +3501,13 @@ app.post("/api/users", async (req, res) => {
       historico: JSON.stringify([]),
       pontos: 0,
       role: "customer", // Adicionado para manter consistência com outros cadastros
+      fullAccess: false,
     };
 
     await db("users").insert(newUser);
 
     console.log(`✅ Novo usuário (Doc: ${docClean}) criado com sucesso.`);
-    res.status(201).json({ ...newUser, historico: [] });
+    res.status(201).json(normalizeUserResponse(newUser));
   } catch (e) {
     console.error("❌ Erro ao salvar usuário:", e);
     res.status(500).json({ error: "Erro ao salvar usuário" });
@@ -3497,20 +3592,38 @@ app.post("/api/orders", async (req, res) => {
   } = req.body;
 
   try {
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Itens do pedido são obrigatórios" });
+    }
+
+    const trimmedUserName = String(userName || "").trim();
+    const effectiveUserId = userId || `guest_${Date.now()}`;
+
+    if (!userId && !trimmedUserName) {
+      return res.status(400).json({
+        error: "Nome obrigatório para comprar sem cadastro",
+      });
+    }
+
     // Iniciamos uma transação para garantir integridade dos dados
     await db.transaction(async (trx) => {
       // 1. Garante que o usuário existe
-      const userExists = await trx("users").where({ id: userId }).first();
+      const userExists = await trx("users").where({ id: effectiveUserId }).first();
       if (!userExists) {
         await trx("users").insert({
-          id: userId,
-          name: userName || "Convidado",
+          id: effectiveUserId,
+          name: trimmedUserName,
           email: null,
           cpf: userDoc ? String(userDoc).replace(/\D/g, "") : null, // Salva o CPF/CNPJ aqui!
           historico: "[]",
           pontos: 0,
+          role: "customer",
+          fullAccess: false,
         });
       }
+      const currentUser =
+        userExists || (await trx("users").where({ id: effectiveUserId }).first());
+      const currentUserHasFullAccess = userHasFullAccess(currentUser);
 
       // 2. Checagem de existencia e calculo de sob encomenda
       const productsById = new Map();
@@ -3518,6 +3631,11 @@ app.post("/api/orders", async (req, res) => {
         const product = await trx("products").where({ id: item.id }).first();
         if (!product) {
           throw new Error(`Produto ${item.id} não encontrado no estoque!`);
+        }
+        if (isImportedProduct(product) && !currentUserHasFullAccess) {
+          throw new Error(
+            `Produto ${product.name || item.id} exige acesso completo para compra.`,
+          );
         }
         productsById.set(String(item.id), product);
       }
@@ -3554,8 +3672,8 @@ app.post("/api/orders", async (req, res) => {
 
       const newOrder = {
         id: `order_${Date.now()}`,
-        userId: userId,
-        userName: userName || "Cliente",
+        userId: effectiveUserId,
+        userName: trimmedUserName || currentUser?.name || "Cliente",
         total: total,
         timestamp: new Date().toISOString(),
         status: "pending",
@@ -6681,7 +6799,7 @@ app.get("/api/payment-online/status/:paymentId", async (req, res) => {
 
 app.put("/api/users/:id", async (req, res) => {
   const { id } = req.params;
-  const { name, email, cpf, cep, address, phone, password } = req.body;
+  const { name, email, cpf, cep, address, phone, password, fullAccess } = req.body;
   if (!name || !email || !cpf || !cep || !address || !phone || !password) {
     return res.status(400).json({ error: "Todos os campos são obrigatórios" });
   }
@@ -6702,15 +6820,13 @@ app.put("/api/users/:id", async (req, res) => {
         address: address.trim(),
         phone: phone.trim(),
         password: password,
+        ...(fullAccess !== undefined ? { fullAccess: isTruthyDb(fullAccess) } : {}),
       });
     // Retorna o usuário atualizado
     const updatedUser = await db("users").where({ id }).first();
     res.json({
       success: true,
-      user: {
-        ...updatedUser,
-        historico: parseJSON(updatedUser.historico),
-      },
+      user: normalizeUserResponse(updatedUser),
     });
   } catch (e) {
     console.error("Erro ao atualizar usuário:", e);
