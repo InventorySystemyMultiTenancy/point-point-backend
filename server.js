@@ -193,6 +193,13 @@ const IMPORTED_CATEGORY_NAME = "importados";
 const normalizeCategoryName = (category) =>
   String(category || "").trim().toLowerCase();
 
+const makeCategoryIdFromName = (name) =>
+  `cat_${normalizeCategoryName(name)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")}`;
+
 const isImportedProduct = (product) =>
   normalizeCategoryName(product?.category) === IMPORTED_CATEGORY_NAME;
 
@@ -3146,11 +3153,54 @@ app.delete(
 // Listar categorias
 app.get("/api/categories", async (req, res) => {
   try {
-    const hasFullAccess = await resolveCatalogFullAccess(req);
-    const categories = await db("categories")
+    const catalogMode =
+      req.query.catalog === "true" || req.query.mode === "catalog";
+    const hasFullAccess = catalogMode
+      ? await resolveCatalogFullAccess(req)
+      : true;
+
+    const categoriesFromTable = await db("categories")
       .select("id", "name", "icon", "order", "created_at")
       .orderBy("order", "asc")
       .orderBy("name", "asc");
+
+    const productCategoryQuery = db("products")
+      .distinct("category")
+      .whereNotNull("category")
+      .whereNot("category", "");
+
+    if (catalogMode) {
+      productCategoryQuery.where({ active: true });
+    }
+
+    const categoriesFromProducts = await productCategoryQuery;
+    const categoriesByName = new Map();
+
+    categoriesFromTable.forEach((category) => {
+      categoriesByName.set(normalizeCategoryName(category.name), category);
+    });
+
+    categoriesFromProducts.forEach(({ category }) => {
+      const categoryName = String(category || "").trim();
+      const normalizedName = normalizeCategoryName(categoryName);
+      if (!categoryName || categoriesByName.has(normalizedName)) return;
+
+      categoriesByName.set(normalizedName, {
+        id: makeCategoryIdFromName(categoryName),
+        name: categoryName,
+        icon: "📦",
+        order: 999,
+        created_at: null,
+        source: "products",
+      });
+    });
+
+    const categories = Array.from(categoriesByName.values()).sort((a, b) => {
+      const orderDiff = (Number(a.order) || 0) - (Number(b.order) || 0);
+      if (orderDiff !== 0) return orderDiff;
+      return String(a.name || "").localeCompare(String(b.name || ""), "pt-BR");
+    });
+
     const visibleCategories = hasFullAccess
       ? categories
       : categories.filter(
