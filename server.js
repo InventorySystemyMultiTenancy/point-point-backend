@@ -486,6 +486,7 @@ async function initDatabase() {
       table.integer("stock"); // NULL = estoque ilimitado, 0 = esgotado
       table.integer("stock_reserved").defaultTo(0); // Estoque reservado temporariamente
       table.boolean("active").notNullable().defaultTo(true);
+      table.integer("quantidadeVenda").defaultTo(1);
       table.integer("minStock").defaultTo(0); // Estoque mínimo
     });
     // Adiciona coluna imageUrl se não existir
@@ -558,6 +559,16 @@ async function initDatabase() {
         table.boolean("active").notNullable().defaultTo(true);
       });
       console.log("Coluna active adicionada a tabela products");
+    }
+    const hasQuantidadeVenda = await db.schema.hasColumn(
+      "products",
+      "quantidadeVenda",
+    );
+    if (!hasQuantidadeVenda) {
+      await db.schema.table("products", (table) => {
+        table.integer("quantidadeVenda").defaultTo(1);
+      });
+      console.log("Coluna quantidadeVenda adicionada a tabela products");
     }
     const hasValorRecebidoDetalhado = await db.schema.hasColumn(
       "super_admin_receivables",
