@@ -59,6 +59,26 @@ const parseJSON = (data) => {
 };
 
 // --- Configuração das Filas ---
+const isTruthyDb = (value) =>
+  value === true || value === 1 || value === "1" || value === "true";
+
+const restoreDeductedStock = async (items) => {
+  for (const item of Array.isArray(items) ? items : []) {
+    const productId = item?.id || item?.productId || item?.product_id;
+    const quantity = Number(item?.quantity) || 0;
+    if (!productId || quantity <= 0) continue;
+
+    const product = await db("products").where({ id: productId }).first();
+    if (!product || product.stock === null || product.stock === undefined) {
+      continue;
+    }
+
+    await db("products")
+      .where({ id: productId })
+      .update({ stock: (Number(product.stock) || 0) + quantity });
+  }
+};
+
 const redisConfig = { redis: REDIS_URL };
 
 const cleanupIntentsQueue = new Queue("cleanup-intents", redisConfig);
@@ -122,6 +142,10 @@ expireOrdersQueue.process(async (job) => {
   for (const order of expiredOrders) {
     const items = parseJSON(order.items);
 
+    if (isTruthyDb(order.stockDeducted)) {
+      await restoreDeductedStock(items);
+    }
+
     // Libera estoque
     for (const item of items) {
       const product = await db("products").where({ id: item.id }).first();
@@ -138,6 +162,7 @@ expireOrdersQueue.process(async (job) => {
     await db("orders").where({ id: order.id }).update({
       status: "expired",
       paymentStatus: "expired",
+      stockDeducted: false,
     });
 
     expired++;

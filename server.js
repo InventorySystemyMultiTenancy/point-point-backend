@@ -35,6 +35,8 @@ const allowedOrigins = [
   "https://point-point-frontend.vercel.app",
   "https://primeplush.vercel.app",
   "https://primeplush.com.br",
+  "https://pointpoint.selfmachine.com.br",
+  "https://www.pointpoint.selfmachine.com.br",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
@@ -181,6 +183,46 @@ const getBackorderMeta = (product, quantity = 1) => {
     backorderQuantity,
     backorderNotice: backorderQuantity > 0 ? BACKORDER_NOTICE : null,
   };
+};
+
+const isTruthyDb = (value) =>
+  value === true || value === 1 || value === "1" || value === "true";
+
+const getItemProductId = (item) => item?.id || item?.productId || item?.product_id;
+
+const adjustStockForOrderItems = async (query, items, direction = -1) => {
+  const changedItems = [];
+
+  for (const item of Array.isArray(items) ? items : []) {
+    const productId = getItemProductId(item);
+    const quantity = Number(item?.quantity) || 0;
+
+    if (!productId || quantity <= 0) {
+      continue;
+    }
+
+    const product = await query("products").where({ id: productId }).first();
+    if (!product || product.stock === null || product.stock === undefined) {
+      continue;
+    }
+
+    const currentStock = Number(product.stock) || 0;
+    const nextStock = currentStock + direction * quantity;
+
+    await query("products").where({ id: productId }).update({
+      stock: nextStock,
+    });
+
+    changedItems.push({
+      productId,
+      name: item?.name || product.name || "Produto",
+      quantity,
+      stockBefore: currentStock,
+      stockAfter: nextStock,
+    });
+  }
+
+  return changedItems;
 };
 
 const normalizeProductResponse = (product) => {
@@ -676,6 +718,7 @@ async function initDatabase() {
       table.timestamp("completedAt");
       table.boolean("hasBackorder").defaultTo(false);
       table.text("backorderNotice");
+      table.boolean("stockDeducted").defaultTo(false);
       table.boolean("hiddenFromHistory").defaultTo(false);
       table.timestamp("hiddenAt");
       table.string("hiddenBy");
@@ -736,6 +779,7 @@ async function initDatabase() {
   const backorderOrderColumns = [
     { name: "hasBackorder", type: "boolean" },
     { name: "backorderNotice", type: "text" },
+    { name: "stockDeducted", type: "boolean" },
   ];
   for (const col of backorderOrderColumns) {
     const hasCol = await db.schema.hasColumn("orders", col.name);
@@ -762,6 +806,50 @@ async function initDatabase() {
         if (col.type === "decimal") table.decimal(col.name, 12, 2);
       });
       console.log(`Coluna '${col.name}' adicionada a orders`);
+    }
+  }
+
+  if (!(await db.schema.hasTable("order_products"))) {
+    await db.schema.createTable("order_products", (table) => {
+      table.increments("id").primary();
+      table
+        .string("order_id")
+        .notNullable()
+        .references("id")
+        .inTable("orders")
+        .onDelete("CASCADE");
+      table
+        .string("product_id")
+        .references("id")
+        .inTable("products")
+        .onDelete("SET NULL");
+      table.integer("quantity").notNullable().defaultTo(1);
+      table.decimal("price", 12, 2).notNullable().defaultTo(0);
+      table.timestamp("created_at").defaultTo(db.fn.now());
+    });
+    console.log("Tabela 'order_products' criada com sucesso");
+  } else {
+    const orderProductsColumns = [
+      { name: "order_id", type: "string" },
+      { name: "product_id", type: "string" },
+      { name: "quantity", type: "integer" },
+      { name: "price", type: "decimal" },
+      { name: "created_at", type: "timestamp" },
+    ];
+
+    for (const col of orderProductsColumns) {
+      const hasCol = await db.schema.hasColumn("order_products", col.name);
+      if (!hasCol) {
+        await db.schema.table("order_products", (table) => {
+          if (col.type === "string") table.string(col.name);
+          if (col.type === "integer") table.integer(col.name).defaultTo(1);
+          if (col.type === "decimal")
+            table.decimal(col.name, 12, 2).defaultTo(0);
+          if (col.type === "timestamp")
+            table.timestamp(col.name).defaultTo(db.fn.now());
+        });
+        console.log(`Coluna '${col.name}' adicionada a order_products`);
+      }
     }
   }
 
@@ -958,18 +1046,23 @@ async function initDatabase() {
         order.cep = user.cep || order.cep;
       }
 
+      const { generateStyledOrderPdf } =
+        await import("./services/styledOrderPdf.js");
+      const pdfBuffer = await generateStyledOrderPdf(order);
+
       // PDF estilizado
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader(
         "Content-Disposition",
         `inline; filename=pedido-${order.id}.pdf`,
       );
-      const { generateStyledOrderPdf } =
-        await import("./services/styledOrderPdf.js");
-      generateStyledOrderPdf(order, res);
+      res.send(pdfBuffer);
     } catch (error) {
       console.error("Erro ao gerar PDF do pedido:", error);
-      res.status(500).json({ error: "Erro ao gerar PDF do pedido" });
+      if (!res.headersSent) {
+        return res.status(500).json({ error: "Erro ao gerar PDF do pedido" });
+      }
+      res.end();
     }
   });
   // ...existing code...
@@ -3448,6 +3541,16 @@ app.post("/api/orders", async (req, res) => {
           })
         : [];
       const hasBackorder = itemsWithPrecoBruto.some((item) => item.isBackorder);
+      const stockMovements = await adjustStockForOrderItems(
+        trx,
+        itemsWithPrecoBruto,
+        -1,
+      );
+      stockMovements.forEach((movement) => {
+        console.log(
+          `  ✅ [Pedido] ${movement.name}: ${movement.stockBefore} → ${movement.stockAfter} (-${movement.quantity})`,
+        );
+      });
 
       const newOrder = {
         id: `order_${Date.now()}`,
@@ -3464,6 +3567,7 @@ app.post("/api/orders", async (req, res) => {
         observation: observation || null,
         hasBackorder,
         backorderNotice: hasBackorder ? BACKORDER_NOTICE : null,
+        stockDeducted: stockMovements.length > 0,
         installments: installments || null,
         fee: fee || null,
         created_at: new Date(),
@@ -3528,6 +3632,10 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
         .status(500)
         .json({ error: "Erro ao processar itens do pedido" });
     }
+    if (isTruthyDb(order.stockDeducted)) {
+      console.log(`Pedido ${id} ja teve estoque descontado na criacao`);
+      items = [];
+    }
 
     // Decrement stock for each product in the order
     for (const item of items) {
@@ -3548,7 +3656,10 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
       }
     }
 
-    await db("orders").where({ id }).update({ paymentStatus: "paid" });
+    await db("orders").where({ id }).update({
+      paymentStatus: "paid",
+      stockDeducted: true,
+    });
     res.json({
       success: true,
       message: "Pedido marcado como pago e estoque atualizado",
@@ -3633,7 +3744,11 @@ app.put("/api/orders/:id", async (req, res) => {
     }
 
     // Se pagamento foi aprovado, CONFIRMA a dedução do estoque
-    if (isPaymentApproved && order.paymentStatus === "pending") {
+    if (
+      isPaymentApproved &&
+      order.paymentStatus === "pending" &&
+      !isTruthyDb(order.stockDeducted)
+    ) {
       console.log(`✅ Pagamento aprovado! Confirmando dedução do estoque...`);
 
       const items = parseJSON(order.items);
@@ -3661,6 +3776,10 @@ app.put("/api/orders/:id", async (req, res) => {
       }
 
       console.log(`🎉 Estoque confirmado e deduzido!`);
+      updates.stockDeducted = true;
+    } else if (isPaymentApproved && isTruthyDb(order.stockDeducted)) {
+      updates.stockDeducted = true;
+      console.log(`Pedido ${id} ja teve estoque descontado na criacao`);
     }
 
     await db("orders").where({ id }).update(updates);
@@ -3708,6 +3827,15 @@ app.delete(
         );
 
         const items = parseJSON(order.items);
+
+        if (isTruthyDb(order.stockDeducted)) {
+          const restoredItems = await adjustStockForOrderItems(db, items, 1);
+          restoredItems.forEach((movement) => {
+            console.log(
+              `  ↩️ ${movement.name}: estoque ${movement.stockBefore} → ${movement.stockAfter} (+${movement.quantity})`,
+            );
+          });
+        }
 
         for (const item of items) {
           const product = await db("products").where({ id: item.id }).first();
@@ -3976,6 +4104,9 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
             if (order && order.paymentStatus === "pending") {
               // Libera estoque
               const items = parseJSON(order.items);
+              if (isTruthyDb(order.stockDeducted)) {
+                await adjustStockForOrderItems(db, items, 1);
+              }
               for (const item of items) {
                 const product = await db("products")
                   .where({ id: item.id })
@@ -4002,6 +4133,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
               await db("orders").where({ id: orderId }).update({
                 paymentStatus: "canceled",
                 status: "canceled",
+                stockDeducted: false,
               });
               console.log(`✅ Pedido ${orderId} cancelado via IPN`);
             }
@@ -4099,6 +4231,9 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                 if (order && order.paymentStatus === "pending") {
                   // Libera estoque
                   const items = parseJSON(order.items);
+                  if (isTruthyDb(order.stockDeducted)) {
+                    await adjustStockForOrderItems(db, items, 1);
+                  }
                   for (const item of items) {
                     const product = await db("products")
                       .where({ id: item.id })
@@ -4125,6 +4260,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                   await db("orders").where({ id: orderId }).update({
                     paymentStatus: "canceled",
                     status: "canceled",
+                    stockDeducted: false,
                   });
                   console.log(`✅ Pedido ${orderId} cancelado via IPN Card`);
                 }
@@ -4220,6 +4356,9 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
             if (order && order.paymentStatus === "pending") {
               // Libera estoque
               const items = parseJSON(order.items);
+              if (isTruthyDb(order.stockDeducted)) {
+                await adjustStockForOrderItems(db, items, 1);
+              }
               for (const item of items) {
                 const product = await db("products")
                   .where({ id: item.id })
@@ -4245,6 +4384,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
               await db("orders").where({ id: orderId }).update({
                 paymentStatus: "canceled",
                 status: "canceled",
+                stockDeducted: false,
               });
               console.log(`✅ Pedido ${orderId} cancelado via IPN PIX`);
             }
@@ -4373,6 +4513,7 @@ app.post("/api/webhooks/mercadopago", async (req, res) => {
                   status: "active",
                   paymentType: "online",
                   paymentMethod: payment.payment_method_id || "unknown",
+                  stockDeducted: true,
                 });
               // Envia PDF por email para o cliente, se houver email
               if (order.email) {
@@ -4407,6 +4548,22 @@ app.post("/api/webhooks/mercadopago", async (req, res) => {
             payment.external_reference || "não informado"
           }`,
         );
+
+        const externalRef = payment.external_reference;
+        if (externalRef) {
+          const order = await db("orders").where({ id: externalRef }).first();
+          if (order && order.paymentStatus === "pending") {
+            const items = parseJSON(order.items);
+            if (isTruthyDb(order.stockDeducted)) {
+              await adjustStockForOrderItems(db, items, 1);
+            }
+            await db("orders").where({ id: externalRef }).update({
+              paymentStatus: "canceled",
+              status: "canceled",
+              stockDeducted: false,
+            });
+          }
+        }
 
         // Remove do cache se existir
         const amountInCents = Math.round(payment.transaction_amount * 100);

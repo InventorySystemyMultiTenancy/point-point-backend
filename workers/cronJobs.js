@@ -47,6 +47,26 @@ const parseJSON = (data) => {
   return data || [];
 };
 
+const isTruthyDb = (value) =>
+  value === true || value === 1 || value === "1" || value === "true";
+
+const restoreDeductedStock = async (items) => {
+  for (const item of Array.isArray(items) ? items : []) {
+    const productId = item?.id || item?.productId || item?.product_id;
+    const quantity = Number(item?.quantity) || 0;
+    if (!productId || quantity <= 0) continue;
+
+    const product = await db("products").where({ id: productId }).first();
+    if (!product || product.stock === null || product.stock === undefined) {
+      continue;
+    }
+
+    await db("products")
+      .where({ id: productId })
+      .update({ stock: (Number(product.stock) || 0) + quantity });
+  }
+};
+
 const cleanupExpiredOutsourcedServices = async () => {
   const cutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
   const expiredServices = await db("outsourced_services")
@@ -140,6 +160,10 @@ const expireOrders = cron.schedule("*/10 * * * *", async () => {
       for (const order of expiredOrders) {
         const items = parseJSON(order.items);
 
+        if (isTruthyDb(order.stockDeducted)) {
+          await restoreDeductedStock(items);
+        }
+
         // Libera estoque reservado
         for (const item of items) {
           const product = await db("products").where({ id: item.id }).first();
@@ -164,6 +188,7 @@ const expireOrders = cron.schedule("*/10 * * * *", async () => {
         await db("orders").where({ id: order.id }).update({
           status: "expired",
           paymentStatus: "expired",
+          stockDeducted: false,
         });
 
         console.log(`   ❌ Pedido ${order.id} marcado como expirado`);

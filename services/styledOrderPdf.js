@@ -2,9 +2,19 @@ import PDFDocument from "pdfkit";
 import path from "path";
 import fs from "fs";
 
-export function generateStyledOrderPdf(order, res) {
+const toNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+export function generateStyledOrderPdf(order) {
   const doc = new PDFDocument({ margin: 40, size: "A4" });
-  doc.pipe(res);
+  const buffers = [];
+  const done = new Promise((resolve, reject) => {
+    doc.on("data", (chunk) => buffers.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(buffers)));
+    doc.on("error", reject);
+  });
 
   // Centralizar logo com espaçamento adequado
   const logoPath = path.join(process.cwd(), "public", "logo.png");
@@ -198,13 +208,15 @@ export function generateStyledOrderPdf(order, res) {
       item.price !== undefined
         ? item.price
         : item.valor_unit || item.unit_price || 0;
+    const numericQtd = toNumber(qtd) || 1;
+    const numericValor = toNumber(valor);
     doc
       .font("Helvetica")
       .fontSize(11)
       .text(nome, 40, y)
       .text(qtd, 200, y)
-      .text(`R$ ${(valor || 0).toFixed(2)}`, 250, y)
-      .text(`R$ ${(valor * qtd).toFixed(2)}`, 350, y);
+      .text(`R$ ${numericValor.toFixed(2)}`, 250, y)
+      .text(`R$ ${(numericValor * numericQtd).toFixed(2)}`, 350, y);
     y += 16;
   });
 
@@ -215,7 +227,7 @@ export function generateStyledOrderPdf(order, res) {
     .fontSize(13)
     .text("TOTAL:", 250, y)
     .text(
-      `R$ ${(order.total !== undefined ? order.total : order.valor_total || 0).toFixed(2)}`,
+      `R$ ${toNumber(order.total !== undefined ? order.total : order.valor_total || 0).toFixed(2)}`,
       350,
       y,
     );
@@ -237,4 +249,5 @@ export function generateStyledOrderPdf(order, res) {
   y += 44;
 
   doc.end();
+  return done;
 }
