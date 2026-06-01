@@ -183,6 +183,40 @@ const getBackorderMeta = (product, quantity = 1) => {
   };
 };
 
+const normalizeProductResponse = (product) => {
+  const parsedImages = parseJSON(product.images);
+  const normalizedImages =
+    Array.isArray(parsedImages) && parsedImages.length > 0
+      ? parsedImages
+      : product.imageUrl
+        ? [product.imageUrl]
+        : [];
+  const stockAvailable = getStockAvailable(product);
+
+  return {
+    ...product,
+    price: product.price !== undefined ? parseFloat(product.price) : 0,
+    priceRaw:
+      product.priceRaw !== undefined && product.priceRaw !== null
+        ? parseFloat(product.priceRaw)
+        : 0,
+    imageUrl: normalizedImages[0] || product.imageUrl || null,
+    images: normalizedImages,
+    stock_reserved: Number(product.stock_reserved) || 0,
+    stock_available: stockAvailable,
+    isAvailable: true,
+    isBackorder: stockAvailable !== null && stockAvailable <= 0,
+    backorderQuantity:
+      stockAvailable !== null && stockAvailable < 0
+        ? Math.abs(stockAvailable)
+        : 0,
+    backorderNotice:
+      stockAvailable !== null && stockAvailable <= 0
+        ? BACKORDER_NOTICE
+        : null,
+  };
+};
+
 const OUTSOURCED_SERVICE_TYPES = {
   fabric_cutting: {
     label: "Retirada de tecido para corte",
@@ -1186,40 +1220,7 @@ app.get("/api/menu", async (req, res) => {
       `✅ [GET /api/menu] Retornando ${products.length} produtos (single-tenant)`,
     );
 
-    res.json(
-      products.map((p) => {
-        const parsedImages = parseJSON(p.images);
-        const normalizedImages =
-          Array.isArray(parsedImages) && parsedImages.length > 0
-            ? parsedImages
-            : p.imageUrl
-              ? [p.imageUrl]
-              : [];
-
-        const stockAvailable = getStockAvailable(p); // null = ilimitado
-
-        return {
-          ...p,
-          price: parseFloat(p.price),
-          priceRaw: p.priceRaw !== undefined ? parseFloat(p.priceRaw) : 0,
-          imageUrl: normalizedImages[0] || p.imageUrl || null,
-          images: normalizedImages,
-          stock: p.stock,
-          stock_reserved: p.stock_reserved || 0,
-          stock_available: stockAvailable,
-          isAvailable: true,
-          isBackorder: stockAvailable !== null && stockAvailable <= 0,
-          backorderQuantity:
-            stockAvailable !== null && stockAvailable < 0
-              ? Math.abs(stockAvailable)
-              : 0,
-          backorderNotice:
-            stockAvailable !== null && stockAvailable <= 0
-              ? BACKORDER_NOTICE
-              : null,
-        };
-      }),
-    );
+    res.json(products.map(normalizeProductResponse));
   } catch (e) {
     console.error(`❌ [GET /api/menu] ERRO ao buscar menu:`, e.message);
     console.error(`❌ [GET /api/menu] Stack:`, e.stack);
@@ -2801,35 +2802,7 @@ app.get(
   async (req, res) => {
     try {
       const products = await db("products").select("*").orderBy("id");
-      res.json(
-        products.map((p) => {
-          const parsedImages = parseJSON(p.images);
-          const normalizedImages =
-            Array.isArray(parsedImages) && parsedImages.length > 0
-              ? parsedImages
-              : p.imageUrl
-                ? [p.imageUrl]
-                : [];
-
-          return {
-            ...p,
-            imageUrl: normalizedImages[0] || p.imageUrl || null,
-            images: normalizedImages,
-            stock_available: getStockAvailable(p),
-            isAvailable: true,
-            isBackorder:
-              getStockAvailable(p) !== null && getStockAvailable(p) <= 0,
-            backorderQuantity:
-              getStockAvailable(p) !== null && getStockAvailable(p) < 0
-                ? Math.abs(getStockAvailable(p))
-                : 0,
-            backorderNotice:
-              getStockAvailable(p) !== null && getStockAvailable(p) <= 0
-                ? BACKORDER_NOTICE
-                : null,
-          };
-        }),
-      );
+      res.json(products.map(normalizeProductResponse));
     } catch (e) {
       console.error("Erro ao buscar todos os produtos:", e);
       res.status(500).json({ error: "Erro ao buscar produtos" });
@@ -2892,20 +2865,7 @@ app.post(
       };
 
       await db("products").insert(newProduct);
-      res.status(201).json({
-        ...newProduct,
-        images: parseJSON(newProduct.images),
-        stock_available: getStockAvailable(newProduct),
-        isAvailable: true,
-        isBackorder:
-          getStockAvailable(newProduct) !== null &&
-          getStockAvailable(newProduct) <= 0,
-        backorderNotice:
-          getStockAvailable(newProduct) !== null &&
-          getStockAvailable(newProduct) <= 0
-            ? BACKORDER_NOTICE
-            : null,
-      });
+      res.status(201).json(normalizeProductResponse(newProduct));
     } catch (e) {
       console.error("Erro ao criar produto:", e);
       res.status(500).json({ error: "Erro ao criar produto" });
@@ -2976,29 +2936,7 @@ app.put(
       await db("products").where({ id }).update(updates);
 
       const updated = await db("products").where({ id }).first();
-      res.json({
-        ...updated,
-        images: (() => {
-          const parsedImages = parseJSON(updated.images);
-          if (Array.isArray(parsedImages) && parsedImages.length > 0) {
-            return parsedImages;
-          }
-          return updated.imageUrl ? [updated.imageUrl] : [];
-        })(),
-        price: parseFloat(updated.price),
-        stock_available: getStockAvailable(updated),
-        isAvailable: true,
-        isBackorder:
-          getStockAvailable(updated) !== null && getStockAvailable(updated) <= 0,
-        backorderQuantity:
-          getStockAvailable(updated) !== null && getStockAvailable(updated) < 0
-            ? Math.abs(getStockAvailable(updated))
-            : 0,
-        backorderNotice:
-          getStockAvailable(updated) !== null && getStockAvailable(updated) <= 0
-            ? BACKORDER_NOTICE
-            : null,
-      });
+      res.json(normalizeProductResponse(updated));
     } catch (e) {
       console.error("Erro ao atualizar produto:", e);
       res.status(500).json({ error: "Erro ao atualizar produto" });
@@ -3223,7 +3161,7 @@ app.get(
   async (req, res) => {
     try {
       const products = await db("products").select("*").orderBy("id");
-      res.json(products);
+      res.json(products.map(normalizeProductResponse));
     } catch (e) {
       console.error("Erro ao buscar todos os produtos:", e);
       res.status(500).json({ error: "Erro ao buscar produtos" });
