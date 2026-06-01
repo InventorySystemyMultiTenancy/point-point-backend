@@ -156,6 +156,33 @@ const parseJSON = (data) => {
   return data || [];
 };
 
+const BACKORDER_NOTICE =
+  "Produto sob encomenda: prazo minimo de espera de 7 dias uteis.";
+
+const getStockAvailable = (product) => {
+  if (!product || product.stock === null || product.stock === undefined) {
+    return null;
+  }
+
+  return Number(product.stock) - (Number(product.stock_reserved) || 0);
+};
+
+const getBackorderMeta = (product, quantity = 1) => {
+  const stockAvailable = getStockAvailable(product);
+  const requestedQuantity = Number(quantity) || 1;
+  const backorderQuantity =
+    stockAvailable === null
+      ? 0
+      : Math.max(0, requestedQuantity - stockAvailable);
+
+  return {
+    stockAvailable,
+    isBackorder: backorderQuantity > 0,
+    backorderQuantity,
+    backorderNotice: backorderQuantity > 0 ? BACKORDER_NOTICE : null,
+  };
+};
+
 const OUTSOURCED_SERVICE_TYPES = {
   fabric_cutting: {
     label: "Retirada de tecido para corte",
@@ -602,6 +629,8 @@ async function initDatabase() {
       table.decimal("fee", 8, 2);
       table.json("items").notNullable();
       table.timestamp("completedAt");
+      table.boolean("hasBackorder").defaultTo(false);
+      table.text("backorderNotice");
       table.boolean("hiddenFromHistory").defaultTo(false);
       table.timestamp("hiddenAt");
       table.string("hiddenBy");
@@ -645,6 +674,21 @@ async function initDatabase() {
       table.string("hiddenBy");
     });
     console.log("✅ Coluna 'hiddenBy' adicionada à tabela orders");
+  }
+
+  const backorderOrderColumns = [
+    { name: "hasBackorder", type: "boolean" },
+    { name: "backorderNotice", type: "text" },
+  ];
+  for (const col of backorderOrderColumns) {
+    const hasCol = await db.schema.hasColumn("orders", col.name);
+    if (!hasCol) {
+      await db.schema.table("orders", (table) => {
+        if (col.type === "boolean") table.boolean(col.name).defaultTo(false);
+        if (col.type === "text") table.text(col.name);
+      });
+      console.log(`Coluna '${col.name}' adicionada a orders`);
+    }
   }
 
   const superAdminOrderColumns = [
@@ -1141,10 +1185,7 @@ app.get("/api/menu", async (req, res) => {
               ? [p.imageUrl]
               : [];
 
-        const stockAvailable =
-          p.stock === null
-            ? null // ilimitado
-            : Math.max(0, p.stock - (p.stock_reserved || 0)); // disponível = total - reservado
+        const stockAvailable = getStockAvailable(p); // null = ilimitado
 
         return {
           ...p,
@@ -1155,7 +1196,16 @@ app.get("/api/menu", async (req, res) => {
           stock: p.stock,
           stock_reserved: p.stock_reserved || 0,
           stock_available: stockAvailable,
-          isAvailable: stockAvailable === null || stockAvailable > 0,
+          isAvailable: true,
+          isBackorder: stockAvailable !== null && stockAvailable <= 0,
+          backorderQuantity:
+            stockAvailable !== null && stockAvailable < 0
+              ? Math.abs(stockAvailable)
+              : 0,
+          backorderNotice:
+            stockAvailable !== null && stockAvailable <= 0
+              ? BACKORDER_NOTICE
+              : null,
         };
       }),
     );
@@ -1405,6 +1455,57 @@ app.get(
     } catch (e) {
       console.error("Erro ao buscar movimentacoes de estoque:", e);
       res.status(500).json({ error: "Erro ao buscar movimentacoes de estoque" });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/backordered-products",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const products = await db("products")
+        .select("*")
+        .whereNotNull("stock")
+        .andWhere("stock", "<", 0)
+        .orderBy("stock", "asc");
+
+      const orders = await db("orders")
+        .select("*")
+        .where({ hasBackorder: true })
+        .orderBy("timestamp", "desc")
+        .limit(100);
+
+      res.json({
+        success: true,
+        notice: BACKORDER_NOTICE,
+        totalProducts: products.length,
+        totalBackorderedUnits: products.reduce(
+          (sum, product) => sum + Math.abs(Number(product.stock) || 0),
+          0,
+        ),
+        products: products.map((product) => ({
+          id: product.id,
+          name: product.name,
+          category: product.category,
+          stock: Number(product.stock) || 0,
+          backorderQuantity: Math.abs(Number(product.stock) || 0),
+          minStock: Number(product.minStock) || 0,
+          imageUrl: product.imageUrl || null,
+          notice: BACKORDER_NOTICE,
+        })),
+        orders: orders.map((order) => ({
+          ...order,
+          items: parseJSON(order.items),
+          total: parseFloat(order.total),
+          hasBackorder: !!order.hasBackorder,
+          backorderNotice: order.backorderNotice || BACKORDER_NOTICE,
+        })),
+      });
+    } catch (e) {
+      console.error("Erro ao buscar produtos sob encomenda:", e);
+      res.status(500).json({ error: "Erro ao buscar produtos sob encomenda" });
     }
   },
 );
@@ -2524,7 +2625,11 @@ app.get(
           averageDailySales > 0 ? stock / averageDailySales : null;
 
         let severity = "";
-        if (stock <= minStock) {
+        let alertType = "low_stock";
+        if (stock < 0) {
+          severity = "critical";
+          alertType = "backorder";
+        } else if (stock <= minStock) {
           severity = "critical";
         } else if (
           stock <= safetyStock ||
@@ -2557,6 +2662,11 @@ app.get(
             daysToStockout === null ? null : Number(daysToStockout.toFixed(1)),
           suggestedPurchase,
           severity,
+          alertType,
+          isBackorder: alertType === "backorder",
+          backorderQuantity: alertType === "backorder" ? Math.abs(stock) : 0,
+          backorderNotice:
+            alertType === "backorder" ? BACKORDER_NOTICE : null,
         });
       });
 
@@ -2694,6 +2804,18 @@ app.get(
             ...p,
             imageUrl: normalizedImages[0] || p.imageUrl || null,
             images: normalizedImages,
+            stock_available: getStockAvailable(p),
+            isAvailable: true,
+            isBackorder:
+              getStockAvailable(p) !== null && getStockAvailable(p) <= 0,
+            backorderQuantity:
+              getStockAvailable(p) !== null && getStockAvailable(p) < 0
+                ? Math.abs(getStockAvailable(p))
+                : 0,
+            backorderNotice:
+              getStockAvailable(p) !== null && getStockAvailable(p) <= 0
+                ? BACKORDER_NOTICE
+                : null,
           };
         }),
       );
@@ -2762,7 +2884,16 @@ app.post(
       res.status(201).json({
         ...newProduct,
         images: parseJSON(newProduct.images),
-        isAvailable: newProduct.stock === null || newProduct.stock > 0,
+        stock_available: getStockAvailable(newProduct),
+        isAvailable: true,
+        isBackorder:
+          getStockAvailable(newProduct) !== null &&
+          getStockAvailable(newProduct) <= 0,
+        backorderNotice:
+          getStockAvailable(newProduct) !== null &&
+          getStockAvailable(newProduct) <= 0
+            ? BACKORDER_NOTICE
+            : null,
       });
     } catch (e) {
       console.error("Erro ao criar produto:", e);
@@ -2844,7 +2975,18 @@ app.put(
           return updated.imageUrl ? [updated.imageUrl] : [];
         })(),
         price: parseFloat(updated.price),
-        isAvailable: updated.stock === null || updated.stock > 0,
+        stock_available: getStockAvailable(updated),
+        isAvailable: true,
+        isBackorder:
+          getStockAvailable(updated) !== null && getStockAvailable(updated) <= 0,
+        backorderQuantity:
+          getStockAvailable(updated) !== null && getStockAvailable(updated) < 0
+            ? Math.abs(getStockAvailable(updated))
+            : 0,
+        backorderNotice:
+          getStockAvailable(updated) !== null && getStockAvailable(updated) <= 0
+            ? BACKORDER_NOTICE
+            : null,
       });
     } catch (e) {
       console.error("Erro ao atualizar produto:", e);
@@ -3316,27 +3458,35 @@ app.post("/api/orders", async (req, res) => {
         });
       }
 
-      // 2. Checagem de estoque
+      // 2. Checagem de existencia e calculo de sob encomenda
+      const productsById = new Map();
       for (const item of items) {
         const product = await trx("products").where({ id: item.id }).first();
         if (!product) {
           throw new Error(`Produto ${item.id} não encontrado no estoque!`);
         }
-        if (product.stock !== null && product.stock < item.quantity) {
-          throw new Error(
-            `Estoque insuficiente para ${item.name}. Disponível: ${product.stock}, Solicitado: ${item.quantity}`,
-          );
-        }
+        productsById.set(String(item.id), product);
       }
 
       // 3. Garante precoBruto em todos os itens
       const itemsWithPrecoBruto = Array.isArray(items)
-        ? items.map((item) => ({
-            ...item,
-            precoBruto:
-              item.precoBruto !== undefined ? Number(item.precoBruto) : 0,
-          }))
+        ? items.map((item) => {
+            const product = productsById.get(String(item.id));
+            const backorderMeta = getBackorderMeta(product, item.quantity);
+
+            return {
+              ...item,
+              precoBruto:
+                item.precoBruto !== undefined ? Number(item.precoBruto) : 0,
+              stockAtOrder: product?.stock ?? null,
+              stockAvailableAtOrder: backorderMeta.stockAvailable,
+              isBackorder: backorderMeta.isBackorder,
+              backorderQuantity: backorderMeta.backorderQuantity,
+              backorderNotice: backorderMeta.backorderNotice,
+            };
+          })
         : [];
+      const hasBackorder = itemsWithPrecoBruto.some((item) => item.isBackorder);
 
       const newOrder = {
         id: `order_${Date.now()}`,
@@ -3351,6 +3501,8 @@ app.post("/api/orders", async (req, res) => {
         paymentMethod: paymentMethod || null,
         items: JSON.stringify(itemsWithPrecoBruto),
         observation: observation || null,
+        hasBackorder,
+        backorderNotice: hasBackorder ? BACKORDER_NOTICE : null,
         installments: installments || null,
         fee: fee || null,
         created_at: new Date(),
@@ -3371,7 +3523,7 @@ app.post("/api/orders", async (req, res) => {
       }
 
       console.log(`✅ Pedido ${newOrder.id} criado com sucesso!`);
-      res.status(201).json({ ...newOrder, items: items || [] });
+      res.status(201).json({ ...newOrder, items: itemsWithPrecoBruto });
     });
   } catch (e) {
     console.error("❌ Erro ao salvar pedido:", e);
@@ -3420,7 +3572,7 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
     for (const item of items) {
       const product = await db("products").where({ id: item.id }).first();
       if (product && product.stock !== null) {
-        const newStock = Math.max(0, product.stock - item.quantity);
+        const newStock = Number(product.stock) - (Number(item.quantity) || 0);
         const newReserved = Math.max(
           0,
           (product.stock_reserved || 0) - item.quantity,
@@ -3530,7 +3682,7 @@ app.put("/api/orders/:id", async (req, res) => {
 
         if (product && product.stock !== null) {
           // Deduz do estoque real e libera da reserva
-          const newStock = Math.max(0, product.stock - item.quantity);
+          const newStock = Number(product.stock) - (Number(item.quantity) || 0);
           const newReserved = Math.max(
             0,
             (product.stock_reserved || 0) - item.quantity,
@@ -4237,17 +4389,15 @@ app.post("/api/webhooks/mercadopago", async (req, res) => {
                   .first();
 
                 if (product && product.stock !== null) {
-                  const newStock = product.stock - item.quantity;
+                  const newStock =
+                    Number(product.stock) - (Number(item.quantity) || 0);
 
                   await db("products")
                     .where({ id: item.id })
-                    .update({ stock: Math.max(0, newStock) });
+                    .update({ stock: newStock });
 
                   console.log(
-                    `  ✅ ${item.name}: ${product.stock} → ${Math.max(
-                      0,
-                      newStock,
-                    )} (${item.quantity} vendido)`,
+                    `  ✅ ${item.name}: ${product.stock} → ${newStock} (${item.quantity} vendido)`,
                   );
                 } else if (product) {
                   console.log(`  ℹ️ ${item.name}: estoque ilimitado`);
@@ -5293,14 +5443,12 @@ app.post("/api/ai/suggestion", async (req, res) => {
       "stock",
     );
 
-    const availableProducts = products.filter(
-      (p) => p.stock === null || p.stock > 0,
-    );
-
-    const productList = availableProducts
+    const productList = products
       .map(
         (p) =>
-          `- ${p.name} (${p.category}) - R$ ${p.price} ${
+          `- ${p.name} (${p.category}) - R$ ${p.price}${
+            p.stock !== null && p.stock <= 0 ? " - sob encomenda" : ""
+          } ${
             p.description ? "- " + p.description : ""
           }`,
       )
@@ -5919,6 +6067,9 @@ Seja direto, prático e use emojis. Priorize ações que o administrador pode to
         lowStock: products.filter((p) => p.stock !== null && p.stock <= 5)
           .length,
         outOfStock: products.filter((p) => p.stock === 0).length,
+        backorderedProducts: products.filter(
+          (p) => p.stock !== null && Number(p.stock) < 0,
+        ).length,
       },
       analysis: analysis,
       rawData: salesStats, // Para o frontend criar gráficos se quiser
