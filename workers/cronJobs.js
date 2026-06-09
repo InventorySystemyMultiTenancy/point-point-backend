@@ -50,9 +50,11 @@ const parseJSON = (data) => {
 const isTruthyDb = (value) =>
   value === true || value === 1 || value === "1" || value === "true";
 
+const getItemProductId = (item) => item?.productId || item?.id || item?.product_id;
+
 const restoreDeductedStock = async (items) => {
   for (const item of Array.isArray(items) ? items : []) {
-    const productId = item?.id || item?.productId || item?.product_id;
+    const productId = getItemProductId(item);
     const quantity = Number(item?.quantity) || 0;
     if (!productId || quantity <= 0) continue;
 
@@ -166,7 +168,8 @@ const expireOrders = cron.schedule("*/10 * * * *", async () => {
 
         // Libera estoque reservado
         for (const item of items) {
-          const product = await db("products").where({ id: item.id }).first();
+          const productId = getItemProductId(item);
+          const product = await db("products").where({ id: productId }).first();
 
           if (product && product.stock !== null && product.stock_reserved > 0) {
             const newReserved = Math.max(
@@ -175,7 +178,7 @@ const expireOrders = cron.schedule("*/10 * * * *", async () => {
             );
 
             await db("products")
-              .where({ id: item.id })
+              .where({ id: productId })
               .update({ stock_reserved: newReserved });
 
             console.log(

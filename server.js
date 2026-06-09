@@ -171,11 +171,13 @@ const getStockAvailable = (product) => {
 
 const getBackorderMeta = (product, quantity = 1) => {
   const stockAvailable = getStockAvailable(product);
-  const requestedQuantity = Number(quantity) || 1;
+  const requestedQuantity = Math.max(0, Number(quantity) || 1);
   const backorderQuantity =
     stockAvailable === null
       ? 0
-      : Math.max(0, requestedQuantity - stockAvailable);
+      : stockAvailable <= 0
+        ? requestedQuantity
+        : Math.max(0, requestedQuantity - stockAvailable);
 
   return {
     stockAvailable,
@@ -253,7 +255,7 @@ const normalizeUserResponse = (user) => ({
   fullAccess: userHasFullAccess(user),
 });
 
-const getItemProductId = (item) => item?.id || item?.productId || item?.product_id;
+const getItemProductId = (item) => item?.productId || item?.id || item?.product_id;
 
 const adjustStockForOrderItems = async (query, items, direction = -1) => {
   const changedItems = [];
@@ -1665,7 +1667,7 @@ app.get(
   authorizeAdmin,
   async (req, res) => {
     try {
-      const products = await db("products")
+      const negativeStockProducts = await db("products")
         .select("*")
         .whereNotNull("stock")
         .andWhere("stock", "<", 0)
@@ -1674,15 +1676,67 @@ app.get(
       const orders = await db("orders")
         .select("*")
         .where({ hasBackorder: true })
+        .andWhere(function () {
+          this.whereNotIn("paymentStatus", [
+            "canceled",
+            "cancelled",
+            "rejected",
+            "refunded",
+          ]).orWhereNull("paymentStatus");
+        })
+        .andWhere(function () {
+          this.whereNot("status", "canceled").orWhereNull("status");
+        })
         .orderBy("timestamp", "desc")
         .limit(100);
+
+      const pendingBackordersByProduct = new Map();
+      for (const order of orders) {
+        const orderItems = parseJSON(order.items);
+        for (const item of orderItems) {
+          if (!item?.isBackorder) continue;
+
+          const productId = getItemProductId(item);
+          if (!productId) continue;
+
+          const current = pendingBackordersByProduct.get(String(productId)) || 0;
+          pendingBackordersByProduct.set(
+            String(productId),
+            current + (Number(item.backorderQuantity) || 0),
+          );
+        }
+      }
+
+      const productsById = new Map(
+        negativeStockProducts.map((product) => [String(product.id), product]),
+      );
+      const missingProductIds = [...pendingBackordersByProduct.keys()].filter(
+        (productId) => !productsById.has(productId),
+      );
+      if (missingProductIds.length > 0) {
+        const pendingProducts = await db("products")
+          .select("*")
+          .whereIn("id", missingProductIds);
+        pendingProducts.forEach((product) => {
+          productsById.set(String(product.id), product);
+        });
+      }
+
+      const products = [...productsById.values()].sort(
+        (a, b) => (Number(a.stock) || 0) - (Number(b.stock) || 0),
+      );
 
       res.json({
         success: true,
         notice: BACKORDER_NOTICE,
         totalProducts: products.length,
         totalBackorderedUnits: products.reduce(
-          (sum, product) => sum + Math.abs(Number(product.stock) || 0),
+          (sum, product) =>
+            sum +
+            Math.max(
+              Math.abs(Math.min(0, Number(product.stock) || 0)),
+              pendingBackordersByProduct.get(String(product.id)) || 0,
+            ),
           0,
         ),
         products: products.map((product) => ({
@@ -1690,7 +1744,12 @@ app.get(
           name: product.name,
           category: product.category,
           stock: Number(product.stock) || 0,
-          backorderQuantity: Math.abs(Number(product.stock) || 0),
+          backorderQuantity: Math.max(
+            Math.abs(Math.min(0, Number(product.stock) || 0)),
+            pendingBackordersByProduct.get(String(product.id)) || 0,
+          ),
+          pendingBackorderQuantity:
+            pendingBackordersByProduct.get(String(product.id)) || 0,
           minStock: Number(product.minStock) || 0,
           imageUrl: product.imageUrl || null,
           notice: BACKORDER_NOTICE,
@@ -3690,26 +3749,34 @@ app.post("/api/orders", async (req, res) => {
       // 2. Checagem de existencia e calculo de sob encomenda
       const productsById = new Map();
       for (const item of items) {
-        const product = await trx("products").where({ id: item.id }).first();
+        const productId = getItemProductId(item);
+        if (!productId) {
+          throw new Error("Item do pedido sem ID de produto.");
+        }
+
+        const product = await trx("products").where({ id: productId }).first();
         if (!product) {
-          throw new Error(`Produto ${item.id} não encontrado no estoque!`);
+          throw new Error(`Produto ${productId} não encontrado no estoque!`);
         }
         if (isImportedProduct(product) && !currentUserHasFullAccess) {
           throw new Error(
-            `Produto ${product.name || item.id} exige acesso completo para compra.`,
+            `Produto ${product.name || productId} exige acesso completo para compra.`,
           );
         }
-        productsById.set(String(item.id), product);
+        productsById.set(String(productId), product);
       }
 
       // 3. Garante precoBruto em todos os itens
       const itemsWithPrecoBruto = Array.isArray(items)
         ? items.map((item) => {
-            const product = productsById.get(String(item.id));
+            const productId = getItemProductId(item);
+            const product = productsById.get(String(productId));
             const backorderMeta = getBackorderMeta(product, item.quantity);
 
             return {
               ...item,
+              id: productId,
+              productId,
               precoBruto:
                 item.precoBruto !== undefined ? Number(item.precoBruto) : 0,
               stockAtOrder: product?.stock ?? null,
@@ -3757,10 +3824,10 @@ app.post("/api/orders", async (req, res) => {
       await trx("orders").insert(newOrder);
 
       // 5. Salva os itens do pedido na tabela order_products
-      if (Array.isArray(items) && items.length > 0) {
-        const orderProducts = items.map((item) => ({
+      if (itemsWithPrecoBruto.length > 0) {
+        const orderProducts = itemsWithPrecoBruto.map((item) => ({
           order_id: newOrder.id,
-          product_id: item.id,
+          product_id: getItemProductId(item),
           quantity: item.quantity || 1,
           price: item.price !== undefined ? item.price : 0,
         }));
@@ -3817,24 +3884,12 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
       items = [];
     }
 
-    // Decrement stock for each product in the order
-    for (const item of items) {
-      const product = await db("products").where({ id: item.id }).first();
-      if (product && product.stock !== null) {
-        const newStock = Number(product.stock) - (Number(item.quantity) || 0);
-        const newReserved = Math.max(
-          0,
-          (product.stock_reserved || 0) - item.quantity,
-        );
-        await db("products").where({ id: item.id }).update({
-          stock: newStock,
-          stock_reserved: newReserved,
-        });
-        console.log(
-          `  ✅ [Manual] ${item.name}: ${product.stock} → ${newStock} (-${item.quantity}), reserva: ${product.stock_reserved} → ${newReserved}`,
-        );
-      }
-    }
+    const stockMovements = await adjustStockForOrderItems(db, items, -1);
+    stockMovements.forEach((movement) => {
+      console.log(
+        `  ✅ [Manual] ${movement.name}: ${movement.stockBefore} → ${movement.stockAfter} (-${movement.quantity})`,
+      );
+    });
 
     await db("orders").where({ id }).update({
       paymentStatus: "paid",
@@ -3933,27 +3988,12 @@ app.put("/api/orders/:id", async (req, res) => {
 
       const items = parseJSON(order.items);
 
-      for (const item of items) {
-        const product = await db("products").where({ id: item.id }).first();
-
-        if (product && product.stock !== null) {
-          // Deduz do estoque real e libera da reserva
-          const newStock = Number(product.stock) - (Number(item.quantity) || 0);
-          const newReserved = Math.max(
-            0,
-            (product.stock_reserved || 0) - item.quantity,
-          );
-
-          await db("products").where({ id: item.id }).update({
-            stock: newStock,
-            stock_reserved: newReserved,
-          });
-
-          console.log(
-            `  ✅ ${item.name}: ${product.stock} → ${newStock} (-${item.quantity}), reserva: ${product.stock_reserved} → ${newReserved}`,
-          );
-        }
-      }
+      const stockMovements = await adjustStockForOrderItems(db, items, -1);
+      stockMovements.forEach((movement) => {
+        console.log(
+          `  ✅ ${movement.name}: ${movement.stockBefore} → ${movement.stockAfter} (-${movement.quantity})`,
+        );
+      });
 
       console.log(`🎉 Estoque confirmado e deduzido!`);
       updates.stockDeducted = true;
@@ -4018,7 +4058,8 @@ app.delete(
         }
 
         for (const item of items) {
-          const product = await db("products").where({ id: item.id }).first();
+          const productId = getItemProductId(item);
+          const product = await db("products").where({ id: productId }).first();
 
           if (product && product.stock !== null && product.stock_reserved > 0) {
             const newReserved = Math.max(
@@ -4027,7 +4068,7 @@ app.delete(
             );
 
             await db("products")
-              .where({ id: item.id })
+              .where({ id: productId })
               .update({ stock_reserved: newReserved });
 
             console.log(
@@ -4107,7 +4148,7 @@ app.delete(
         const items = parseJSON(order.items);
 
         for (const item of Array.isArray(items) ? items : []) {
-          const productId = item?.id || item?.productId;
+          const productId = getItemProductId(item);
           const quantity = Number(item?.quantity) || 0;
 
           if (!productId || quantity <= 0) {
@@ -4285,11 +4326,12 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
               // Libera estoque
               const items = parseJSON(order.items);
               if (isTruthyDb(order.stockDeducted)) {
-                await adjustStockForOrderItems(db, items, 1);
+              await adjustStockForOrderItems(db, items, 1);
               }
               for (const item of items) {
+                const productId = getItemProductId(item);
                 const product = await db("products")
-                  .where({ id: item.id })
+                  .where({ id: productId })
                   .first();
                 if (
                   product &&
@@ -4301,7 +4343,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                     product.stock_reserved - item.quantity,
                   );
                   await db("products")
-                    .where({ id: item.id })
+                    .where({ id: productId })
                     .update({ stock_reserved: newReserved });
                   console.log(
                     `  ↩️ Estoque liberado: ${item.name} (${product.stock_reserved} → ${newReserved})`,
@@ -4415,8 +4457,9 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                     await adjustStockForOrderItems(db, items, 1);
                   }
                   for (const item of items) {
+                    const productId = getItemProductId(item);
                     const product = await db("products")
-                      .where({ id: item.id })
+                      .where({ id: productId })
                       .first();
                     if (
                       product &&
@@ -4428,7 +4471,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                         product.stock_reserved - item.quantity,
                       );
                       await db("products")
-                        .where({ id: item.id })
+                        .where({ id: productId })
                         .update({ stock_reserved: newReserved });
                       console.log(
                         `↩️ Estoque liberado: ${item.name} (${product.stock_reserved} → ${newReserved})`,
@@ -4540,8 +4583,9 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                 await adjustStockForOrderItems(db, items, 1);
               }
               for (const item of items) {
+                const productId = getItemProductId(item);
                 const product = await db("products")
-                  .where({ id: item.id })
+                  .where({ id: productId })
                   .first();
                 if (
                   product &&
@@ -4553,7 +4597,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                     product.stock_reserved - item.quantity,
                   );
                   await db("products")
-                    .where({ id: item.id })
+                    .where({ id: productId })
                     .update({ stock_reserved: newReserved });
                   console.log(
                     `↩️ Estoque liberado: ${item.name} (${product.stock_reserved} → ${newReserved})`,
@@ -4663,26 +4707,21 @@ app.post("/api/webhooks/mercadopago", async (req, res) => {
               const items = parseJSON(order.items);
               console.log(`  🛒 ${items.length} item(ns) no pedido`);
 
-              // Desconta cada produto
-              for (const item of items) {
-                const product = await db("products")
-                  .where({ id: item.id })
-                  .first();
-
-                if (product && product.stock !== null) {
-                  const newStock =
-                    Number(product.stock) - (Number(item.quantity) || 0);
-
-                  await db("products")
-                    .where({ id: item.id })
-                    .update({ stock: newStock });
-
+              if (isTruthyDb(order.stockDeducted)) {
+                console.log(
+                  `  ✅ Pedido ${externalRef} ja teve estoque descontado na criacao`,
+                );
+              } else {
+                const stockMovements = await adjustStockForOrderItems(
+                  db,
+                  items,
+                  -1,
+                );
+                stockMovements.forEach((movement) => {
                   console.log(
-                    `  ✅ ${item.name}: ${product.stock} → ${newStock} (${item.quantity} vendido)`,
+                    `  ✅ ${movement.name}: ${movement.stockBefore} → ${movement.stockAfter} (${movement.quantity} vendido)`,
                   );
-                } else if (product) {
-                  console.log(`  ℹ️ ${item.name}: estoque ilimitado`);
-                }
+                });
               }
 
               // Atualiza o pedido para pago e ativo, salvando forma de pagamento
@@ -5293,8 +5332,9 @@ app.get("/api/payment/status/:paymentId", async (req, res) => {
               // 1. Libera o estoque reservado
               const items = parseJSON(order.items);
               for (const item of items) {
+                const productId = getItemProductId(item);
                 const product = await db("products")
-                  .where({ id: item.id })
+                  .where({ id: productId })
                   .first();
                 if (
                   product &&
@@ -5306,7 +5346,7 @@ app.get("/api/payment/status/:paymentId", async (req, res) => {
                     product.stock_reserved - item.quantity,
                   );
                   await db("products")
-                    .where({ id: item.id })
+                    .where({ id: productId })
                     .update({ stock_reserved: newReserved });
                   console.log(
                     `    ↩️ Estoque liberado para ${item.name}: ${product.stock_reserved} → ${newReserved}`,
@@ -6011,7 +6051,7 @@ app.get("/api/ai/kitchen-priority", async (req, res) => {
 
       // Calcula "peso" do pedido (quantidade x complexidade estimada)
       const categories = items.map(
-        (item) => productMap[item.id]?.category || "outro",
+        (item) => productMap[getItemProductId(item)]?.category || "outro",
       );
       const hasHotFood = categories.some((c) =>
         ["Pastel", "Hambúrguer", "Pizza"].includes(c),
@@ -6256,11 +6296,12 @@ app.get("/api/ai/inventory-analysis", async (req, res) => {
     orders.forEach((order) => {
       const items = parseJSON(order.items);
       items.forEach((item) => {
-        if (salesStats[item.id]) {
-          salesStats[item.id].totalSold += item.quantity || 1;
-          salesStats[item.id].revenue +=
+        const productId = getItemProductId(item);
+        if (salesStats[productId]) {
+          salesStats[productId].totalSold += item.quantity || 1;
+          salesStats[productId].revenue +=
             (item.price || 0) * (item.quantity || 1);
-          salesStats[item.id].orderCount += 1;
+          salesStats[productId].orderCount += 1;
         }
       });
     });
@@ -6463,17 +6504,21 @@ app.get("/api/super-admin/top-products", async (req, res) => {
     orders.forEach((order) => {
       const items = parseJSON(order.items);
       items.forEach((item) => {
-        if (!productSales[item.id]) {
-          productSales[item.id] = {
+        const productId = getItemProductId(item);
+        if (!productId) return;
+
+        if (!productSales[productId]) {
+          productSales[productId] = {
             name: item.name,
             sold: 0,
             revenue: 0,
+            orderCount: 0,
           };
         }
-        productSales[item.id].sold += item.quantity || 1;
-        productSales[item.id].revenue +=
+        productSales[productId].sold += item.quantity || 1;
+        productSales[productId].revenue +=
           (item.price || 0) * (item.quantity || 1);
-        productSales[item.id].orderCount += 1;
+        productSales[productId].orderCount += 1;
       });
     });
 
