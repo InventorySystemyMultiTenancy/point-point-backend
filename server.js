@@ -337,19 +337,44 @@ const normalizeProductResponse = (product) => {
 const OUTSOURCED_SERVICE_TYPES = {
   fabric_cutting: {
     label: "Retirada de tecido para corte",
-    inputUnit: "tecido",
-    outputUnit: "pecas_cortadas",
+    inputUnit: "metros",
+    outputUnit: "unidades",
+    inputMode: "measure",
+    outputMode: "products",
   },
-  embroidery_sewing: {
-    label: "Bordagem e costura",
-    inputUnit: "tecido",
-    outputUnit: "peles_costuradas",
+  embroidery: {
+    label: "Bordagem",
+    inputUnit: "unidades",
+    outputUnit: "unidades",
+    inputMode: "products",
+    outputMode: "products",
   },
-  stuffing_closing: {
-    label: "Enchimento e fechamento",
-    inputUnit: "peles",
-    outputUnit: "pelucias_prontas",
+  sewing: {
+    label: "Costura",
+    inputUnit: "unidades",
+    outputUnit: "unidades",
+    inputMode: "products",
+    outputMode: "products",
   },
+  stuffing: {
+    label: "Enchimento",
+    inputUnit: "unidades",
+    outputUnit: "unidades",
+    inputMode: "products",
+    outputMode: "products",
+  },
+  closing: {
+    label: "Fechamento",
+    inputUnit: "unidades",
+    outputUnit: "unidades",
+    inputMode: "products",
+    outputMode: "products",
+  },
+};
+
+const OUTSOURCED_SERVICE_TYPE_ALIASES = {
+  embroidery_sewing: "embroidery",
+  stuffing_closing: "stuffing",
 };
 
 const OUTSOURCED_SERVICE_RETENTION_DAYS = 60;
@@ -365,11 +390,89 @@ const toPositiveNumber = (value) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
+const toJsonText = (value) =>
+  value === undefined || value === null ? null : JSON.stringify(value);
+
+const validationError = (message) =>
+  Object.assign(new Error(message), { statusCode: 400 });
+
 const toIsoDate = (value) => {
   if (!value) return null;
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 };
+
+const getOutsourcedServiceTypeKey = (serviceType) =>
+  OUTSOURCED_SERVICE_TYPE_ALIASES[serviceType] || serviceType;
+
+const getOutsourcedServiceTypeConfig = (serviceType) =>
+  OUTSOURCED_SERVICE_TYPES[getOutsourcedServiceTypeKey(serviceType)] || null;
+
+const parseOutsourcedItems = (value) => {
+  const parsed = parseJSON(value);
+  return Array.isArray(parsed) ? parsed : [];
+};
+
+const normalizeOutsourcedProductItems = async (
+  items,
+  { required = false, requireStockControlled = true } = {},
+) => {
+  if (items === undefined || items === null || items === "") {
+    if (required) throw validationError("Informe ao menos um produto.");
+    return [];
+  }
+
+  const parsed = typeof items === "string" ? parseJSON(items) : items;
+  if (!Array.isArray(parsed)) {
+    throw validationError("Lista de produtos invalida.");
+  }
+
+  const normalized = [];
+  for (const item of parsed) {
+    const productId = getItemProductId(item);
+    const quantity = toPositiveNumber(
+      item?.quantity ?? item?.expected_quantity ?? item?.returned_quantity,
+    );
+
+    if (!productId || !quantity) {
+      throw validationError(
+        "Cada produto deve ter productId/id e quantidade maior que zero.",
+      );
+    }
+
+    const product = await db("products").where({ id: productId }).first();
+    if (!product) {
+      throw validationError(`Produto ${productId} nao encontrado.`);
+    }
+    if (
+      requireStockControlled &&
+      (product.stock === null || product.stock === undefined)
+    ) {
+      throw validationError(
+        `Produto ${product.name || productId} nao tem estoque controlado.`,
+      );
+    }
+
+    normalized.push({
+      productId,
+      id: productId,
+      name: item?.name || product.name || productId,
+      quantity,
+    });
+  }
+
+  if (required && normalized.length === 0) {
+    throw validationError("Informe ao menos um produto.");
+  }
+
+  return normalized;
+};
+
+const sumOutsourcedItemsQuantity = (items) =>
+  (Array.isArray(items) ? items : []).reduce(
+    (sum, item) => sum + (Number(item.quantity) || 0),
+    0,
+  );
 
 const normalizeOutsourcedCompany = (company) =>
   company
@@ -401,7 +504,8 @@ const getOutsourcedServiceStatus = (service) => {
 const normalizeOutsourcedService = (service) => {
   if (!service) return null;
 
-  const typeConfig = OUTSOURCED_SERVICE_TYPES[service.service_type] || {};
+  const serviceTypeKey = getOutsourcedServiceTypeKey(service.service_type);
+  const typeConfig = getOutsourcedServiceTypeConfig(service.service_type) || {};
   const totalDelivered = Number(service.total_delivered_quantity) || 0;
   const expectedReturn = Number(service.expected_return_quantity) || 0;
   const status = getOutsourcedServiceStatus(service);
@@ -415,10 +519,15 @@ const normalizeOutsourcedService = (service) => {
 
   return {
     ...service,
+    service_type_key: serviceTypeKey,
     service_type_label: typeConfig.label || service.service_type,
     input_unit: service.input_unit || typeConfig.inputUnit || null,
+    input_mode: typeConfig.inputMode || null,
     expected_return_unit:
       service.expected_return_unit || typeConfig.outputUnit || null,
+    output_mode: typeConfig.outputMode || null,
+    input_items: parseOutsourcedItems(service.input_items),
+    expected_return_items: parseOutsourcedItems(service.expected_return_items),
     input_quantity: Number(service.input_quantity) || 0,
     fabric_paid_amount:
       service.fabric_paid_amount === null ||
@@ -1034,10 +1143,12 @@ async function initDatabase() {
       table.string("status").notNullable().defaultTo("pendente");
       table.decimal("input_quantity", 12, 3).notNullable();
       table.string("input_unit").notNullable();
+      table.text("input_items");
       table.decimal("fabric_paid_amount", 12, 2);
       table.decimal("service_cost_amount", 12, 2);
       table.decimal("expected_return_quantity", 12, 3).notNullable();
       table.string("expected_return_unit").notNullable();
+      table.text("expected_return_items");
       table.decimal("total_delivered_quantity", 12, 3).notNullable().defaultTo(0);
       table.timestamp("due_date").notNullable();
       table.timestamp("started_at").defaultTo(db.fn.now());
@@ -1058,6 +1169,19 @@ async function initDatabase() {
       });
       console.log("Coluna service_cost_amount adicionada a outsourced_services");
     }
+    const outsourcedServiceJsonColumns = [
+      "input_items",
+      "expected_return_items",
+    ];
+    for (const colName of outsourcedServiceJsonColumns) {
+      const hasCol = await db.schema.hasColumn("outsourced_services", colName);
+      if (!hasCol) {
+        await db.schema.table("outsourced_services", (table) => {
+          table.text(colName);
+        });
+        console.log(`Coluna ${colName} adicionada a outsourced_services`);
+      }
+    }
   }
 
   if (!(await db.schema.hasTable("outsourced_service_deliveries"))) {
@@ -1069,12 +1193,36 @@ async function initDatabase() {
         .references("id")
         .inTable("outsourced_services")
         .onDelete("CASCADE");
+      table.string("product_id");
+      table.string("product_name");
+      table.text("items");
       table.decimal("quantity", 12, 3).notNullable();
       table.timestamp("delivered_at").notNullable();
       table.text("observation");
       table.timestamp("created_at").defaultTo(db.fn.now());
     });
     console.log("Tabela 'outsourced_service_deliveries' criada com sucesso");
+  } else {
+    const outsourcedDeliveryColumns = [
+      { name: "product_id", type: "string" },
+      { name: "product_name", type: "string" },
+      { name: "items", type: "text" },
+    ];
+    for (const col of outsourcedDeliveryColumns) {
+      const hasCol = await db.schema.hasColumn(
+        "outsourced_service_deliveries",
+        col.name,
+      );
+      if (!hasCol) {
+        await db.schema.table("outsourced_service_deliveries", (table) => {
+          if (col.type === "string") table.string(col.name);
+          if (col.type === "text") table.text(col.name);
+        });
+        console.log(
+          `Coluna ${col.name} adicionada a outsourced_service_deliveries`,
+        );
+      }
+    }
   }
 
   try {
@@ -1938,7 +2086,27 @@ app.get(
         value,
         ...config,
       })),
+      legacyAliases: OUTSOURCED_SERVICE_TYPE_ALIASES,
     });
+  },
+);
+
+app.get(
+  "/api/admin/outsourced-services/products",
+  authenticateToken,
+  authorizeOutsourcedAccess,
+  async (req, res) => {
+    try {
+      const products = await db("products")
+        .select("id", "name", "category", "stock", "imageUrl")
+        .whereNotNull("stock")
+        .orderBy("name", "asc");
+
+      res.json(products.map(normalizeProductResponse));
+    } catch (e) {
+      console.error("Erro ao buscar produtos para terceirizados:", e);
+      res.status(500).json({ error: "Erro ao buscar produtos" });
+    }
   },
 );
 
@@ -2116,6 +2284,7 @@ app.get(
         ...normalizeOutsourcedService(service),
         deliveries: deliveries.map((delivery) => ({
           ...delivery,
+          items: parseOutsourcedItems(delivery.items),
           quantity: Number(delivery.quantity) || 0,
         })),
       });
@@ -2143,15 +2312,26 @@ app.post(
           .json({ error: "Empresa terceirizada ativa e obrigatoria" });
       }
 
-      const typeConfig = OUTSOURCED_SERVICE_TYPES[req.body.service_type];
+      const serviceType = getOutsourcedServiceTypeKey(req.body.service_type);
+      const typeConfig = getOutsourcedServiceTypeConfig(serviceType);
       if (!typeConfig) {
         return res.status(400).json({ error: "Tipo de servico invalido" });
       }
 
-      const inputQuantity = toPositiveNumber(req.body.input_quantity);
-      const expectedReturnQuantity = toPositiveNumber(
-        req.body.expected_return_quantity,
+      const inputItems = await normalizeOutsourcedProductItems(
+        req.body.input_items || req.body.inputItems,
       );
+      const inputQuantity =
+        inputItems.length > 0
+          ? sumOutsourcedItemsQuantity(inputItems)
+          : toPositiveNumber(req.body.input_quantity);
+      const expectedReturnItems = await normalizeOutsourcedProductItems(
+        req.body.expected_return_items || req.body.expectedReturnItems,
+      );
+      const expectedReturnQuantity =
+        expectedReturnItems.length > 0
+          ? sumOutsourcedItemsQuantity(expectedReturnItems)
+          : toPositiveNumber(req.body.expected_return_quantity);
       const dueDate = toIsoDate(req.body.due_date);
       const fabricPaidAmount = toNumberOrNull(req.body.fabric_paid_amount);
       const serviceCostAmount = toNumberOrNull(req.body.service_cost_amount);
@@ -2165,6 +2345,11 @@ app.post(
         return res
           .status(400)
           .json({ error: "Quantidade prevista de retorno e obrigatoria" });
+      }
+      if (typeConfig.outputMode === "products" && expectedReturnItems.length === 0) {
+        return res.status(400).json({
+          error: "Informe os produtos e quantidades previstos para retorno.",
+        });
       }
       if (!dueDate) {
         return res.status(400).json({ error: "Prazo de entrega invalido" });
@@ -2184,14 +2369,16 @@ app.post(
       const service = {
         id: req.body.id || `outs_${Date.now()}`,
         company_id: companyId,
-        service_type: req.body.service_type,
+        service_type: serviceType,
         status: "pendente",
         input_quantity: inputQuantity,
         input_unit: typeConfig.inputUnit,
+        input_items: toJsonText(inputItems),
         fabric_paid_amount: fabricPaidAmount,
         service_cost_amount: serviceCostAmount,
         expected_return_quantity: expectedReturnQuantity,
         expected_return_unit: typeConfig.outputUnit,
+        expected_return_items: toJsonText(expectedReturnItems),
         total_delivered_quantity: 0,
         due_date: dueDate,
         started_at: toIsoDate(req.body.started_at) || now,
@@ -2210,7 +2397,9 @@ app.post(
       );
     } catch (e) {
       console.error("Erro ao criar servico terceirizado:", e);
-      res.status(500).json({ error: "Erro ao criar servico terceirizado" });
+      res
+        .status(e.statusCode || 500)
+        .json({ error: e.statusCode ? e.message : "Erro ao criar servico terceirizado" });
     }
   },
 );
@@ -2232,13 +2421,32 @@ app.post(
         return res.status(400).json({ error: "Servico ja esta concluido" });
       }
 
-      const quantity = toPositiveNumber(req.body.quantity);
+      let deliveryItems = await normalizeOutsourcedProductItems(
+        req.body.items || req.body.return_items || req.body.returnItems,
+      );
+      if (deliveryItems.length === 0 && (req.body.product_id || req.body.productId)) {
+        deliveryItems = await normalizeOutsourcedProductItems([
+          {
+            productId: req.body.product_id || req.body.productId,
+            quantity: req.body.quantity,
+          },
+        ]);
+      }
+      const quantity =
+        deliveryItems.length > 0
+          ? sumOutsourcedItemsQuantity(deliveryItems)
+          : toPositiveNumber(req.body.quantity);
       const deliveredAt = toIsoDate(req.body.delivered_at || req.body.date);
 
       if (!quantity) {
         return res
           .status(400)
           .json({ error: "Quantidade entregue deve ser maior que zero" });
+      }
+      if (deliveryItems.length === 0) {
+        return res.status(400).json({
+          error: "Informe o produto retornado e a quantidade entregue.",
+        });
       }
       if (!deliveredAt) {
         return res.status(400).json({ error: "Data da entrega invalida" });
@@ -2253,6 +2461,9 @@ app.post(
       const delivery = {
         id: req.body.id || `del_${Date.now()}`,
         service_id: req.params.id,
+        product_id: deliveryItems.length === 1 ? deliveryItems[0].productId : null,
+        product_name: deliveryItems.length === 1 ? deliveryItems[0].name : null,
+        items: toJsonText(deliveryItems),
         quantity,
         delivered_at: deliveredAt,
         observation: req.body.observation || null,
@@ -2261,6 +2472,18 @@ app.post(
 
       await db.transaction(async (trx) => {
         await trx("outsourced_service_deliveries").insert(delivery);
+        for (const item of deliveryItems) {
+          const product = await trx("products")
+            .where({ id: item.productId })
+            .first();
+          if (product && product.stock !== null && product.stock !== undefined) {
+            await trx("products")
+              .where({ id: item.productId })
+              .update({
+                stock: (Number(product.stock) || 0) + (Number(item.quantity) || 0),
+              });
+          }
+        }
         await trx("outsourced_services")
           .where({ id: req.params.id })
           .update({
@@ -2280,13 +2503,16 @@ app.post(
       res.status(201).json({
         delivery: {
           ...delivery,
+          items: deliveryItems,
           quantity: Number(delivery.quantity) || 0,
         },
         service: normalizeOutsourcedService(updated),
       });
     } catch (e) {
       console.error("Erro ao lancar entrega terceirizada:", e);
-      res.status(500).json({ error: "Erro ao lancar entrega" });
+      res
+        .status(e.statusCode || 500)
+        .json({ error: e.statusCode ? e.message : "Erro ao lancar entrega" });
     }
   },
 );
