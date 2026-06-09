@@ -792,6 +792,7 @@ async function initDatabase() {
       table.boolean("hiddenFromHistory").defaultTo(false);
       table.timestamp("hiddenAt");
       table.string("hiddenBy");
+      table.boolean("entregueCliente").defaultTo(false);
       table.timestamp("created_at").defaultTo(db.fn.now());
     });
   }
@@ -833,6 +834,17 @@ async function initDatabase() {
       table.string("hiddenBy");
     });
     console.log("✅ Coluna 'hiddenBy' adicionada à tabela orders");
+  }
+
+  const hasEntregueClienteColumn = await db.schema.hasColumn(
+    "orders",
+    "entregueCliente",
+  );
+  if (!hasEntregueClienteColumn) {
+    await db.schema.table("orders", (table) => {
+      table.boolean("entregueCliente").defaultTo(false);
+    });
+    console.log("✅ Coluna 'entregueCliente' adicionada à tabela orders");
   }
 
   const hasOrderCreatedAtColumn = await db.schema.hasColumn(

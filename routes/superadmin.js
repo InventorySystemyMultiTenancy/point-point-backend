@@ -293,10 +293,10 @@ router.get("/super-admin/receivables", superAdminAuth, async (req, res) => {
 router.put("/orders/:id/mark-delivered", async (req, res) => {
   try {
     const { id } = req.params;
-    // Atualiza a coluna entregueCliente para true (1)
+    // Atualiza a coluna entregueCliente para true
     const updated = await db("orders")
       .where({ id })
-      .update({ entregueCliente: 1 });
+      .update({ entregueCliente: true });
     if (updated) {
       return res.json({
         success: true,
