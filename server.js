@@ -257,12 +257,20 @@ const normalizeUserResponse = (user) => ({
 
 const getItemProductId = (item) => item?.productId || item?.id || item?.product_id;
 
+const getItemQuantity = (item, fallback = 1) => {
+  const quantity = Number(
+    item?.quantity ?? item?.quantidade ?? item?.qtd ?? item?.qty ?? fallback,
+  );
+
+  return Number.isFinite(quantity) && quantity > 0 ? quantity : fallback;
+};
+
 const adjustStockForOrderItems = async (query, items, direction = -1) => {
   const changedItems = [];
 
   for (const item of Array.isArray(items) ? items : []) {
     const productId = getItemProductId(item);
-    const quantity = Number(item?.quantity) || 0;
+    const quantity = getItemQuantity(item, 0);
 
     if (!productId || quantity <= 0) {
       continue;
@@ -2677,7 +2685,7 @@ app.get(
         const orderItems = Array.isArray(parsedItems) ? parsedItems : [];
 
         orderItems.forEach((item) => {
-          const quantity = Number(item.quantity) || 1;
+          const quantity = getItemQuantity(item);
           const salePrice = Number(item.price) || 0;
           const itemId = String(
             item.productId || item.id || item.name || "sem-id",
@@ -3770,13 +3778,15 @@ app.post("/api/orders", async (req, res) => {
       const itemsWithPrecoBruto = Array.isArray(items)
         ? items.map((item) => {
             const productId = getItemProductId(item);
+            const quantity = getItemQuantity(item);
             const product = productsById.get(String(productId));
-            const backorderMeta = getBackorderMeta(product, item.quantity);
+            const backorderMeta = getBackorderMeta(product, quantity);
 
             return {
               ...item,
               id: productId,
               productId,
+              quantity,
               precoBruto:
                 item.precoBruto !== undefined ? Number(item.precoBruto) : 0,
               stockAtOrder: product?.stock ?? null,
@@ -3798,6 +3808,21 @@ app.post("/api/orders", async (req, res) => {
           `  ✅ [Pedido] ${movement.name}: ${movement.stockBefore} → ${movement.stockAfter} (-${movement.quantity})`,
         );
       });
+      const stockControlledItems = itemsWithPrecoBruto.filter(
+        (item) => item.stockAtOrder !== null && item.stockAtOrder !== undefined,
+      );
+      if (stockMovements.length < stockControlledItems.length) {
+        const movedProductIds = new Set(
+          stockMovements.map((movement) => String(movement.productId)),
+        );
+        const missingProductIds = stockControlledItems
+          .map((item) => getItemProductId(item))
+          .filter((productId) => !movedProductIds.has(String(productId)));
+
+        throw new Error(
+          `Falha ao baixar estoque dos produtos: ${missingProductIds.join(", ")}`,
+        );
+      }
 
       const newOrder = {
         id: `order_${Date.now()}`,
@@ -3828,7 +3853,7 @@ app.post("/api/orders", async (req, res) => {
         const orderProducts = itemsWithPrecoBruto.map((item) => ({
           order_id: newOrder.id,
           product_id: getItemProductId(item),
-          quantity: item.quantity || 1,
+          quantity: getItemQuantity(item),
           price: item.price !== undefined ? item.price : 0,
         }));
         await trx("order_products").insert(orderProducts);
@@ -4064,7 +4089,7 @@ app.delete(
           if (product && product.stock !== null && product.stock_reserved > 0) {
             const newReserved = Math.max(
               0,
-              product.stock_reserved - item.quantity,
+              product.stock_reserved - getItemQuantity(item, 0),
             );
 
             await db("products")
@@ -4149,7 +4174,7 @@ app.delete(
 
         for (const item of Array.isArray(items) ? items : []) {
           const productId = getItemProductId(item);
-          const quantity = Number(item?.quantity) || 0;
+          const quantity = getItemQuantity(item, 0);
 
           if (!productId || quantity <= 0) {
             continue;
@@ -4340,7 +4365,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                 ) {
                   const newReserved = Math.max(
                     0,
-                    product.stock_reserved - item.quantity,
+                    product.stock_reserved - getItemQuantity(item, 0),
                   );
                   await db("products")
                     .where({ id: productId })
@@ -4468,7 +4493,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                     ) {
                       const newReserved = Math.max(
                         0,
-                        product.stock_reserved - item.quantity,
+                        product.stock_reserved - getItemQuantity(item, 0),
                       );
                       await db("products")
                         .where({ id: productId })
@@ -4594,7 +4619,7 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                 ) {
                   const newReserved = Math.max(
                     0,
-                    product.stock_reserved - item.quantity,
+                    product.stock_reserved - getItemQuantity(item, 0),
                   );
                   await db("products")
                     .where({ id: productId })
@@ -5343,7 +5368,7 @@ app.get("/api/payment/status/:paymentId", async (req, res) => {
                 ) {
                   const newReserved = Math.max(
                     0,
-                    product.stock_reserved - item.quantity,
+                    product.stock_reserved - getItemQuantity(item, 0),
                   );
                   await db("products")
                     .where({ id: productId })
@@ -5877,7 +5902,7 @@ app.post(
               precoVenda = parseFloat(item.price);
             }
           }
-          const quantity = Number(item.quantity) || 1;
+          const quantity = getItemQuantity(item);
           const valueToReceive = (precoVenda - precoBruto) * quantity;
           valorRecebidoPedido += valueToReceive;
           totalBrutoReceber += valueToReceive;
@@ -6047,7 +6072,7 @@ app.get("/api/ai/kitchen-priority", async (req, res) => {
     // 3. Prepara dados dos pedidos para IA analisar
     const orderDetails = orders.map((order) => {
       const items = parseJSON(order.items);
-      const itemCount = items.reduce((sum, item) => sum + item.quantity, 0);
+      const itemCount = items.reduce((sum, item) => sum + getItemQuantity(item), 0);
 
       // Calcula "peso" do pedido (quantidade x complexidade estimada)
       const categories = items.map(
@@ -6298,9 +6323,10 @@ app.get("/api/ai/inventory-analysis", async (req, res) => {
       items.forEach((item) => {
         const productId = getItemProductId(item);
         if (salesStats[productId]) {
-          salesStats[productId].totalSold += item.quantity || 1;
+          const quantity = getItemQuantity(item);
+          salesStats[productId].totalSold += quantity;
           salesStats[productId].revenue +=
-            (item.price || 0) * (item.quantity || 1);
+            (item.price || 0) * quantity;
           salesStats[productId].orderCount += 1;
         }
       });
@@ -6515,9 +6541,10 @@ app.get("/api/super-admin/top-products", async (req, res) => {
             orderCount: 0,
           };
         }
-        productSales[productId].sold += item.quantity || 1;
+        const quantity = getItemQuantity(item);
+        productSales[productId].sold += quantity;
         productSales[productId].revenue +=
-          (item.price || 0) * (item.quantity || 1);
+          (item.price || 0) * quantity;
         productSales[productId].orderCount += 1;
       });
     });
@@ -6710,7 +6737,7 @@ app.post("/api/payment-online/create-preference", async (req, res) => {
 
     // Calcula o total
     const total = items.reduce(
-      (sum, item) => sum + item.price * item.quantity,
+      (sum, item) => sum + item.price * getItemQuantity(item),
       0,
     );
 
@@ -6722,7 +6749,7 @@ app.post("/api/payment-online/create-preference", async (req, res) => {
       body: {
         items: items.map((item) => ({
           title: item.name,
-          quantity: item.quantity,
+          quantity: getItemQuantity(item),
           unit_price: item.price,
           currency_id: "BRL",
         })),

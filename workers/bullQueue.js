@@ -64,10 +64,18 @@ const isTruthyDb = (value) =>
 
 const getItemProductId = (item) => item?.productId || item?.id || item?.product_id;
 
+const getItemQuantity = (item, fallback = 1) => {
+  const quantity = Number(
+    item?.quantity ?? item?.quantidade ?? item?.qtd ?? item?.qty ?? fallback,
+  );
+
+  return Number.isFinite(quantity) && quantity > 0 ? quantity : fallback;
+};
+
 const restoreDeductedStock = async (items) => {
   for (const item of Array.isArray(items) ? items : []) {
     const productId = getItemProductId(item);
-    const quantity = Number(item?.quantity) || 0;
+    const quantity = getItemQuantity(item, 0);
     if (!productId || quantity <= 0) continue;
 
     const product = await db("products").where({ id: productId }).first();
@@ -151,10 +159,11 @@ expireOrdersQueue.process(async (job) => {
     // Libera estoque
     for (const item of items) {
       const productId = getItemProductId(item);
+      const quantity = getItemQuantity(item, 0);
       const product = await db("products").where({ id: productId }).first();
 
       if (product && product.stock !== null && product.stock_reserved > 0) {
-        const newReserved = Math.max(0, product.stock_reserved - item.quantity);
+        const newReserved = Math.max(0, product.stock_reserved - quantity);
         await db("products")
           .where({ id: productId })
           .update({ stock_reserved: newReserved });
