@@ -253,7 +253,49 @@ const normalizeUserResponse = (user) => ({
   ...user,
   historico: parseJSON(user?.historico),
   fullAccess: userHasFullAccess(user),
+  monthlyPayment: isTruthyDb(user?.monthlyPayment),
 });
+
+const userHasMonthlyPayment = (user) => isTruthyDb(user?.monthlyPayment);
+
+const toYearMonth = (date = new Date()) => {
+  const value = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(value.getTime())) return null;
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}`;
+};
+
+const getMonthRange = (yearMonth = toYearMonth()) => {
+  const normalized = String(yearMonth || "").match(/^(\d{4})-(\d{2})$/);
+  if (!normalized) {
+    throw validationError("Mês inválido. Use o formato YYYY-MM.");
+  }
+
+  const year = Number(normalized[1]);
+  const monthIndex = Number(normalized[2]) - 1;
+  const start = new Date(year, monthIndex, 1);
+  const end = new Date(year, monthIndex + 1, 1);
+
+  return {
+    yearMonth: `${year}-${String(monthIndex + 1).padStart(2, "0")}`,
+    start,
+    end,
+    startIso: start.toISOString(),
+    endIso: end.toISOString(),
+  };
+};
+
+const getPreviousYearMonth = () => {
+  const now = new Date();
+  return toYearMonth(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+};
+
+const isMonthlyDeferredPayment = (paymentType, paymentMethod) =>
+  String(paymentType || "").toLowerCase() === "presencial" &&
+  ["a_prazo", "à_prazo", "a prazo", "à prazo", "aprazo"].includes(
+    String(paymentMethod || "")
+      .trim()
+      .toLowerCase(),
+  );
 
 const getItemProductId = (item) => item?.productId || item?.id || item?.product_id;
 
@@ -859,6 +901,7 @@ async function initDatabase() {
       table.json("historico").defaultTo("[]");
       table.integer("pontos").defaultTo(0);
       table.boolean("fullAccess").notNullable().defaultTo(false);
+      table.boolean("monthlyPayment").notNullable().defaultTo(false);
     });
   }
 
@@ -869,6 +912,7 @@ async function initDatabase() {
     { name: "address", type: "text" },
     { name: "phone", type: "string" },
     { name: "fullAccess", type: "boolean" },
+    { name: "monthlyPayment", type: "boolean" },
   ];
   for (const col of userOptionalColumns) {
     const hasCol = await db.schema.hasColumn("users", col.name);
@@ -908,6 +952,10 @@ async function initDatabase() {
       table.boolean("hasBackorder").defaultTo(false);
       table.text("backorderNotice");
       table.boolean("stockDeducted").defaultTo(false);
+      table.boolean("monthlyBilling").defaultTo(false);
+      table.string("monthlyBillingMonth");
+      table.timestamp("monthlyClosedAt");
+      table.string("monthlyClosedBy");
       table.boolean("hiddenFromHistory").defaultTo(false);
       table.timestamp("hiddenAt");
       table.string("hiddenBy");
@@ -981,6 +1029,10 @@ async function initDatabase() {
     { name: "hasBackorder", type: "boolean" },
     { name: "backorderNotice", type: "text" },
     { name: "stockDeducted", type: "boolean" },
+    { name: "monthlyBilling", type: "boolean" },
+    { name: "monthlyBillingMonth", type: "string" },
+    { name: "monthlyClosedAt", type: "timestamp" },
+    { name: "monthlyClosedBy", type: "string" },
   ];
   for (const col of backorderOrderColumns) {
     const hasCol = await db.schema.hasColumn("orders", col.name);
@@ -988,6 +1040,8 @@ async function initDatabase() {
       await db.schema.table("orders", (table) => {
         if (col.type === "boolean") table.boolean(col.name).defaultTo(false);
         if (col.type === "text") table.text(col.name);
+        if (col.type === "string") table.string(col.name);
+        if (col.type === "timestamp") table.timestamp(col.name);
       });
       console.log(`Coluna '${col.name}' adicionada a orders`);
     }
@@ -3713,6 +3767,40 @@ app.patch(
   },
 );
 
+app.patch(
+  "/api/users/:id/monthly-payment",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+    const { monthlyPayment } = req.body;
+
+    if (typeof monthlyPayment === "undefined") {
+      return res.status(400).json({ error: "monthlyPayment é obrigatório" });
+    }
+
+    try {
+      const user = await db("users").where({ id }).first();
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
+
+      await db("users").where({ id }).update({
+        monthlyPayment: isTruthyDb(monthlyPayment),
+      });
+
+      const updatedUser = await db("users").where({ id }).first();
+      res.json({
+        success: true,
+        user: normalizeUserResponse(updatedUser),
+      });
+    } catch (e) {
+      console.error("Erro ao atualizar pagamento mensal:", e);
+      res.status(500).json({ error: "Erro ao atualizar pagamento mensal" });
+    }
+  },
+);
+
 // Endpoint para listar todos os produtos (admin)
 app.get(
   "/api/products",
@@ -3802,6 +3890,7 @@ app.post("/api/users/register", async (req, res) => {
       pontos: 0,
       role: "customer",
       fullAccess: false,
+      monthlyPayment: false,
     };
 
     await db("users").insert(newUser);
@@ -3857,6 +3946,7 @@ app.post("/api/users", async (req, res) => {
       pontos: 0,
       role: "customer", // Adicionado para manter consistência com outros cadastros
       fullAccess: false,
+      monthlyPayment: false,
     };
 
     await db("users").insert(newUser);
@@ -3974,11 +4064,23 @@ app.post("/api/orders", async (req, res) => {
           pontos: 0,
           role: "customer",
           fullAccess: false,
+          monthlyPayment: false,
         });
       }
       const currentUser =
         userExists || (await trx("users").where({ id: effectiveUserId }).first());
       const currentUserHasFullAccess = userHasFullAccess(currentUser);
+      const currentUserHasMonthlyPayment = userHasMonthlyPayment(currentUser);
+      const isMonthlyDeferredOrder = isMonthlyDeferredPayment(
+        paymentType,
+        paymentMethod,
+      );
+
+      if (isMonthlyDeferredOrder && !currentUserHasMonthlyPayment) {
+        throw validationError(
+          "Pagamento a prazo permitido apenas para clientes com pagamento mensal ativo.",
+        );
+      }
 
       // 2. Checagem de existencia e calculo de sob encomenda
       const productsById = new Map();
@@ -4056,11 +4158,11 @@ app.post("/api/orders", async (req, res) => {
         userName: trimmedUserName || currentUser?.name || "Cliente",
         total: total,
         timestamp: new Date().toISOString(),
-        status: "pending",
-        paymentStatus: "pending",
+        status: isMonthlyDeferredOrder ? "active" : "pending",
+        paymentStatus: isMonthlyDeferredOrder ? "monthly_pending" : "pending",
         paymentId: paymentId || null,
         paymentType: paymentType || null,
-        paymentMethod: paymentMethod || null,
+        paymentMethod: isMonthlyDeferredOrder ? "a_prazo" : paymentMethod || null,
         items: JSON.stringify(itemsWithPrecoBruto),
         observation: observation || null,
         hasBackorder,
@@ -4068,6 +4170,10 @@ app.post("/api/orders", async (req, res) => {
         stockDeducted: stockMovements.length > 0,
         installments: installments || null,
         fee: fee || null,
+        monthlyBilling: isMonthlyDeferredOrder,
+        monthlyBillingMonth: isMonthlyDeferredOrder ? toYearMonth() : null,
+        monthlyClosedAt: null,
+        monthlyClosedBy: null,
         created_at: new Date(),
       };
 
@@ -4090,7 +4196,9 @@ app.post("/api/orders", async (req, res) => {
     });
   } catch (e) {
     console.error("❌ Erro ao salvar pedido:", e);
-    res.status(500).json({ error: e.message || "Erro ao salvar ordem" });
+    res
+      .status(e.statusCode || 500)
+      .json({ error: e.message || "Erro ao salvar ordem" });
   }
 });
 
@@ -4106,6 +4214,64 @@ app.get("/api/users/:userId/orders", async (req, res) => {
   } catch (e) {
     console.error("❌ Erro ao buscar pedidos do usuário:", e);
     res.status(500).json({ error: "Erro ao buscar pedidos do usuário" });
+  }
+});
+
+app.post("/api/users/:userId/monthly-closing", async (req, res) => {
+  const { userId } = req.params;
+  const { month, closedBy } = req.body || {};
+
+  try {
+    const user = await db("users").where({ id: userId }).first();
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+    if (!userHasMonthlyPayment(user)) {
+      return res.status(400).json({
+        error: "Cliente não está com pagamento mensal ativo",
+      });
+    }
+
+    const monthRange = getMonthRange(month || toYearMonth());
+    const closedAt = new Date();
+
+    const updatedCount = await db("orders")
+      .where({ userId })
+      .where("timestamp", ">=", monthRange.startIso)
+      .where("timestamp", "<", monthRange.endIso)
+      .whereNotIn("paymentStatus", ["paid", "authorized"])
+      .whereNotIn("status", ["canceled", "cancelled", "expired"])
+      .update({
+        paymentStatus: "paid",
+        monthlyBilling: true,
+        monthlyBillingMonth: monthRange.yearMonth,
+        monthlyClosedAt: closedAt,
+        monthlyClosedBy: closedBy || "admin",
+      });
+
+    const orders = await db("orders")
+      .where({ userId })
+      .where("timestamp", ">=", monthRange.startIso)
+      .where("timestamp", "<", monthRange.endIso)
+      .orderBy("timestamp", "desc");
+
+    res.json({
+      success: true,
+      userId,
+      userName: user.name,
+      month: monthRange.yearMonth,
+      updatedCount,
+      orders: orders.map((order) => ({
+        ...order,
+        items: parseJSON(order.items),
+        total: parseFloat(order.total),
+      })),
+    });
+  } catch (e) {
+    console.error("❌ Erro ao fazer fechamento mensal:", e);
+    res
+      .status(e.statusCode || 500)
+      .json({ error: e.message || "Erro ao fazer fechamento mensal" });
   }
 });
 
@@ -4484,10 +4650,26 @@ app.get("/api/orders/history", async (req, res) => {
     console.log(
       `📋 [GET /api/orders/history] Encontrados ${orders.length} pedidos`,
     );
+    const userIds = [
+      ...new Set(orders.map((order) => order.userId).filter(Boolean)),
+    ];
+    const usersById = new Map();
+    if (userIds.length > 0) {
+      const users = await db("users").whereIn("id", userIds);
+      users.forEach((user) => usersById.set(user.id, user));
+    }
+    const currentMonth = toYearMonth();
     const parsedOrders = orders.map((o) => ({
       ...o,
       items: typeof o.items === "string" ? JSON.parse(o.items) : o.items,
       total: parseFloat(o.total),
+      monthlyBilling: isTruthyDb(o.monthlyBilling),
+      userMonthlyPayment: userHasMonthlyPayment(usersById.get(o.userId)),
+      canMonthlyClose:
+        userHasMonthlyPayment(usersById.get(o.userId)) &&
+        toYearMonth(o.timestamp) === currentMonth &&
+        !["paid", "authorized"].includes(o.paymentStatus) &&
+        !["canceled", "cancelled", "expired"].includes(o.status),
       paymentMethod:
         o.paymentMethod ||
         o.payment_method ||
@@ -4501,6 +4683,64 @@ app.get("/api/orders/history", async (req, res) => {
     res.status(500).json({
       error: "Erro ao buscar histórico de pedidos",
       message: e.message,
+    });
+  }
+});
+
+app.get("/api/orders/history/monthly-alerts", async (req, res) => {
+  try {
+    const monthRange = getMonthRange(req.query.month || getPreviousYearMonth());
+    const monthlyUsers = await db("users").where({ monthlyPayment: true });
+    const userIds = monthlyUsers.map((user) => user.id);
+
+    if (userIds.length === 0) {
+      return res.json({
+        month: monthRange.yearMonth,
+        alerts: [],
+      });
+    }
+
+    const usersById = new Map(monthlyUsers.map((user) => [user.id, user]));
+    const overdueOrders = await db("orders")
+      .whereIn("userId", userIds)
+      .where("timestamp", ">=", monthRange.startIso)
+      .where("timestamp", "<", monthRange.endIso)
+      .whereNotIn("paymentStatus", ["paid", "authorized"])
+      .whereNotIn("status", ["canceled", "cancelled", "expired"])
+      .orderBy("timestamp", "desc");
+
+    const grouped = new Map();
+    overdueOrders.forEach((order) => {
+      const current = grouped.get(order.userId) || {
+        userId: order.userId,
+        userName: usersById.get(order.userId)?.name || order.userName || "Cliente",
+        month: monthRange.yearMonth,
+        orderCount: 0,
+        total: 0,
+        orderIds: [],
+        message: "",
+      };
+
+      current.orderCount += 1;
+      current.total += parseFloat(order.total) || 0;
+      current.orderIds.push(order.id);
+      grouped.set(order.userId, current);
+    });
+
+    const alerts = [...grouped.values()].map((alert) => ({
+      ...alert,
+      total: Number(alert.total.toFixed(2)),
+      message: `${alert.userName} está devendo todos os pedidos do mês passado.`,
+    }));
+
+    res.json({
+      month: monthRange.yearMonth,
+      alerts,
+    });
+  } catch (e) {
+    console.error("❌ Erro ao buscar alertas de pagamento mensal:", e);
+    res.status(e.statusCode || 500).json({
+      error: e.message || "Erro ao buscar alertas de pagamento mensal",
     });
   }
 });
@@ -7159,7 +7399,7 @@ app.get("/api/payment-online/status/:paymentId", async (req, res) => {
 
 app.put("/api/users/:id", async (req, res) => {
   const { id } = req.params;
-  const { name, email, cpf, cep, address, phone, password, fullAccess } = req.body;
+  const { name, email, cpf, cep, address, phone, password, fullAccess, monthlyPayment } = req.body;
   if (!name || !email || !cpf || !cep || !address || !phone || !password) {
     return res.status(400).json({ error: "Todos os campos são obrigatórios" });
   }
@@ -7181,6 +7421,9 @@ app.put("/api/users/:id", async (req, res) => {
         phone: phone.trim(),
         password: password,
         ...(fullAccess !== undefined ? { fullAccess: isTruthyDb(fullAccess) } : {}),
+        ...(monthlyPayment !== undefined
+          ? { monthlyPayment: isTruthyDb(monthlyPayment) }
+          : {}),
       });
     // Retorna o usuário atualizado
     const updatedUser = await db("users").where({ id }).first();
