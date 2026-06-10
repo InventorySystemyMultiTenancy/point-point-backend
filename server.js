@@ -383,6 +383,101 @@ const isMonthlyDeferredPayment = (paymentType, paymentMethod) =>
       .toLowerCase(),
   );
 
+const DELIVERY_METHODS = {
+  carrier: {
+    value: "carrier",
+    label: "Transportadora",
+    requiresCarrier: true,
+  },
+  pickup: {
+    value: "pickup",
+    label: "Retirada no local",
+    requiresCarrier: false,
+  },
+  in_person: {
+    value: "in_person",
+    label: "Presencial",
+    requiresCarrier: false,
+  },
+  contact: {
+    value: "contact",
+    label: "Entrar em contato",
+    requiresCarrier: false,
+  },
+};
+
+const DELIVERY_METHOD_ALIASES = {
+  transportadora: "carrier",
+  carrier: "carrier",
+  retirada: "pickup",
+  retirada_local: "pickup",
+  "retirada no local": "pickup",
+  pickup: "pickup",
+  presencial: "in_person",
+  in_person: "in_person",
+  local: "in_person",
+  contato: "contact",
+  entrar_contato: "contact",
+  "entrar em contato": "contact",
+  contact: "contact",
+};
+
+const normalizeDeliveryMethod = (value) =>
+  DELIVERY_METHOD_ALIASES[String(value || "").trim().toLowerCase()] || "contact";
+
+const getDeliveryMethodMeta = (value) => {
+  const normalized = normalizeDeliveryMethod(value);
+  return DELIVERY_METHODS[normalized] || DELIVERY_METHODS.contact;
+};
+
+const normalizeShippingCarrier = (carrier) =>
+  carrier
+    ? {
+        ...carrier,
+        active: isTruthyDb(carrier.active),
+        trackingUrl: carrier.trackingUrl || null,
+      }
+    : null;
+
+const buildOrderDeliveryPayload = (order, carrier = null) => {
+  const method = getDeliveryMethodMeta(order?.deliveryMethod);
+  const normalizedCarrier = normalizeShippingCarrier(carrier);
+  const trackingUrl =
+    method.value === "carrier" && normalizedCarrier?.trackingUrl
+      ? normalizedCarrier.trackingUrl
+      : null;
+
+  return {
+    deliveryMethod: method.value,
+    deliveryMethodLabel: method.label,
+    deliveryRequiresCarrier: method.requiresCarrier,
+    carrierId: order?.carrierId || null,
+    shippingCarrier: normalizedCarrier,
+    trackingUrl,
+    trackingMessage: trackingUrl
+      ? "Acompanhar entrega"
+      : "Entrar em contato para rastrear",
+  };
+};
+
+const enrichOrdersWithDelivery = async (orders) => {
+  const orderList = Array.isArray(orders) ? orders : [];
+  const carrierIds = [
+    ...new Set(orderList.map((order) => order.carrierId).filter(Boolean)),
+  ];
+  const carriersById = new Map();
+
+  if (carrierIds.length > 0) {
+    const carriers = await db("shipping_carriers").whereIn("id", carrierIds);
+    carriers.forEach((carrier) => carriersById.set(carrier.id, carrier));
+  }
+
+  return orderList.map((order) => ({
+    ...order,
+    ...buildOrderDeliveryPayload(order, carriersById.get(order.carrierId)),
+  }));
+};
+
 const getItemProductId = (item) => item?.productId || item?.id || item?.product_id;
 
 const getItemQuantity = (item, fallback = 1) => {
@@ -1041,6 +1136,44 @@ async function initDatabase() {
     console.log("Tabela 'user_product_prices' criada com sucesso");
   }
 
+  const hasShippingCarriers = await db.schema.hasTable("shipping_carriers");
+  if (!hasShippingCarriers) {
+    await db.schema.createTable("shipping_carriers", (table) => {
+      table.string("id").primary();
+      table.string("name").notNullable();
+      table.text("trackingUrl");
+      table.boolean("active").notNullable().defaultTo(true);
+      table.timestamp("created_at").defaultTo(db.fn.now());
+      table.timestamp("updated_at").defaultTo(db.fn.now());
+    });
+    console.log("Tabela 'shipping_carriers' criada com sucesso");
+  }
+
+  const defaultCarriers = [
+    {
+      id: "carrier_uniao_express",
+      name: "União Express",
+      trackingUrl: "https://www.uniaoexpress.com.br/rastreamento",
+      active: true,
+    },
+    {
+      id: "carrier_outra_transportadora",
+      name: "Outra transportadora",
+      trackingUrl: null,
+      active: true,
+    },
+  ];
+  for (const carrier of defaultCarriers) {
+    const exists = await db("shipping_carriers").where({ id: carrier.id }).first();
+    if (!exists) {
+      await db("shipping_carriers").insert({
+        ...carrier,
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+    }
+  }
+
   const hasOrders = await db.schema.hasTable("orders");
   if (!hasOrders) {
     await db.schema.createTable("orders", (table) => {
@@ -1069,6 +1202,8 @@ async function initDatabase() {
       table.string("monthlyBillingMonth");
       table.timestamp("monthlyClosedAt");
       table.string("monthlyClosedBy");
+      table.string("deliveryMethod").defaultTo("contact");
+      table.string("carrierId");
       table.boolean("hiddenFromHistory").defaultTo(false);
       table.timestamp("hiddenAt");
       table.string("hiddenBy");
@@ -1146,6 +1281,8 @@ async function initDatabase() {
     { name: "monthlyBillingMonth", type: "string" },
     { name: "monthlyClosedAt", type: "timestamp" },
     { name: "monthlyClosedBy", type: "string" },
+    { name: "deliveryMethod", type: "string" },
+    { name: "carrierId", type: "string" },
   ];
   for (const col of backorderOrderColumns) {
     const hasCol = await db.schema.hasColumn("orders", col.name);
@@ -1159,6 +1296,9 @@ async function initDatabase() {
       console.log(`Coluna '${col.name}' adicionada a orders`);
     }
   }
+  await db("orders").whereNull("deliveryMethod").update({
+    deliveryMethod: "contact",
+  });
 
   const superAdminOrderColumns = [
     { name: "repassadoSuperAdmin", type: "boolean" },
@@ -4086,6 +4226,131 @@ app.delete(
   },
 );
 
+app.get("/api/delivery-methods", (req, res) => {
+  res.json(Object.values(DELIVERY_METHODS));
+});
+
+app.get("/api/shipping-carriers", async (req, res) => {
+  try {
+    const includeInactive = req.query.includeInactive === "true";
+    const query = db("shipping_carriers").select("*");
+    if (!includeInactive) query.where({ active: true });
+
+    const carriers = await query.orderBy("name", "asc");
+    res.json(carriers.map(normalizeShippingCarrier));
+  } catch (e) {
+    console.error("Erro ao listar transportadoras:", e);
+    res.status(500).json({ error: "Erro ao listar transportadoras" });
+  }
+});
+
+app.post(
+  "/api/shipping-carriers",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id, name, trackingUrl, active } = req.body;
+    const trimmedName = String(name || "").trim();
+
+    if (!trimmedName) {
+      return res.status(400).json({ error: "Nome da transportadora é obrigatório" });
+    }
+
+    try {
+      const carrierId =
+        id ||
+        `carrier_${trimmedName
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "_")
+          .replace(/^_+|_+$/g, "")}_${Date.now()}`;
+
+      const carrier = {
+        id: carrierId,
+        name: trimmedName,
+        trackingUrl: trackingUrl ? String(trackingUrl).trim() : null,
+        active: active === undefined ? true : isTruthyDb(active),
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+
+      await db("shipping_carriers").insert(carrier);
+      res.status(201).json(normalizeShippingCarrier(carrier));
+    } catch (e) {
+      console.error("Erro ao cadastrar transportadora:", e);
+      res.status(500).json({ error: "Erro ao cadastrar transportadora" });
+    }
+  },
+);
+
+app.put(
+  "/api/shipping-carriers/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+    const { name, trackingUrl, active } = req.body;
+
+    try {
+      const carrier = await db("shipping_carriers").where({ id }).first();
+      if (!carrier) {
+        return res.status(404).json({ error: "Transportadora não encontrada" });
+      }
+
+      const updates = { updated_at: new Date() };
+      if (name !== undefined) {
+        const trimmedName = String(name || "").trim();
+        if (!trimmedName) {
+          return res.status(400).json({ error: "Nome da transportadora é obrigatório" });
+        }
+        updates.name = trimmedName;
+      }
+      if (trackingUrl !== undefined) {
+        updates.trackingUrl = trackingUrl ? String(trackingUrl).trim() : null;
+      }
+      if (active !== undefined) updates.active = isTruthyDb(active);
+
+      await db("shipping_carriers").where({ id }).update(updates);
+      const updated = await db("shipping_carriers").where({ id }).first();
+      res.json(normalizeShippingCarrier(updated));
+    } catch (e) {
+      console.error("Erro ao atualizar transportadora:", e);
+      res.status(500).json({ error: "Erro ao atualizar transportadora" });
+    }
+  },
+);
+
+app.delete(
+  "/api/shipping-carriers/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+
+    try {
+      const carrier = await db("shipping_carriers").where({ id }).first();
+      if (!carrier) {
+        return res.status(404).json({ error: "Transportadora não encontrada" });
+      }
+
+      await db("shipping_carriers").where({ id }).update({
+        active: false,
+        updated_at: new Date(),
+      });
+
+      const updated = await db("shipping_carriers").where({ id }).first();
+      res.json({
+        success: true,
+        carrier: normalizeShippingCarrier(updated),
+      });
+    } catch (e) {
+      console.error("Erro ao desativar transportadora:", e);
+      res.status(500).json({ error: "Erro ao desativar transportadora" });
+    }
+  },
+);
+
 // Endpoint para listar todos os produtos (admin)
 app.get(
   "/api/products",
@@ -4319,6 +4584,8 @@ app.post("/api/orders", async (req, res) => {
     paymentMethod,
     installments,
     fee,
+    deliveryMethod,
+    carrierId,
   } = req.body;
 
   try {
@@ -4328,10 +4595,18 @@ app.post("/api/orders", async (req, res) => {
 
     const trimmedUserName = String(userName || "").trim();
     const effectiveUserId = userId || `guest_${Date.now()}`;
+    const normalizedDeliveryMethod = normalizeDeliveryMethod(deliveryMethod);
+    const deliveryMeta = getDeliveryMethodMeta(normalizedDeliveryMethod);
 
     if (!userId && !trimmedUserName) {
       return res.status(400).json({
         error: "Nome obrigatório para comprar sem cadastro",
+      });
+    }
+
+    if (carrierId && deliveryMeta.value !== "carrier") {
+      return res.status(400).json({
+        error: "carrierId só pode ser informado quando a entrega for transportadora",
       });
     }
 
@@ -4365,6 +4640,17 @@ app.post("/api/orders", async (req, res) => {
         throw validationError(
           "Pagamento a prazo permitido apenas para clientes com pagamento mensal ativo.",
         );
+      }
+
+      let selectedCarrierId = null;
+      if (carrierId && deliveryMeta.value === "carrier") {
+        const carrier = await trx("shipping_carriers")
+          .where({ id: carrierId, active: true })
+          .first();
+        if (!carrier) {
+          throw validationError("Transportadora não encontrada ou inativa.");
+        }
+        selectedCarrierId = carrier.id;
       }
 
       // 2. Checagem de existencia e calculo de sob encomenda
@@ -4480,6 +4766,8 @@ app.post("/api/orders", async (req, res) => {
         monthlyBillingMonth: isMonthlyDeferredOrder ? toYearMonth() : null,
         monthlyClosedAt: null,
         monthlyClosedBy: null,
+        deliveryMethod: deliveryMeta.value,
+        carrierId: selectedCarrierId,
         created_at: new Date(),
       };
 
@@ -4516,12 +4804,76 @@ app.get("/api/users/:userId/orders", async (req, res) => {
     const orders = await db("orders")
       .where({ userId })
       .orderBy("timestamp", "desc");
-    res.json(orders);
+    const enrichedOrders = await enrichOrdersWithDelivery(orders);
+    res.json(
+      enrichedOrders.map((order) => ({
+        ...order,
+        items: parseJSON(order.items),
+        total: parseFloat(order.total),
+      })),
+    );
   } catch (e) {
     console.error("❌ Erro ao buscar pedidos do usuário:", e);
     res.status(500).json({ error: "Erro ao buscar pedidos do usuário" });
   }
 });
+
+app.patch(
+  "/api/orders/:id/delivery",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+    const { deliveryMethod, carrierId } = req.body;
+
+    try {
+      const order = await db("orders").where({ id }).first();
+      if (!order) {
+        return res.status(404).json({ error: "Pedido não encontrado" });
+      }
+
+      const method = getDeliveryMethodMeta(
+        deliveryMethod === undefined ? order.deliveryMethod : deliveryMethod,
+      );
+      let nextCarrierId = null;
+
+      if (method.value === "carrier") {
+        if (carrierId) {
+          const carrier = await db("shipping_carriers")
+            .where({ id: carrierId, active: true })
+            .first();
+          if (!carrier) {
+            return res
+              .status(400)
+              .json({ error: "Transportadora não encontrada ou inativa" });
+          }
+          nextCarrierId = carrier.id;
+        } else if (deliveryMethod === undefined && order.carrierId) {
+          nextCarrierId = order.carrierId;
+        }
+      }
+
+      await db("orders").where({ id }).update({
+        deliveryMethod: method.value,
+        carrierId: nextCarrierId,
+      });
+
+      const updated = await db("orders").where({ id }).first();
+      const [enriched] = await enrichOrdersWithDelivery([updated]);
+      res.json({
+        success: true,
+        order: {
+          ...enriched,
+          items: parseJSON(enriched.items),
+          total: parseFloat(enriched.total),
+        },
+      });
+    } catch (e) {
+      console.error("Erro ao atualizar entrega do pedido:", e);
+      res.status(500).json({ error: "Erro ao atualizar entrega do pedido" });
+    }
+  },
+);
 
 app.post("/api/users/:userId/monthly-closing", async (req, res) => {
   const { userId } = req.params;
@@ -4826,12 +5178,13 @@ app.get("/api/user-orders", async (req, res) => {
       query = query.where({ userId });
     }
     const allOrders = await query.select("*");
+    const enrichedOrders = await enrichOrdersWithDelivery(allOrders);
     console.log(
       `📋 [GET /api/user-orders] ${allOrders.length} pedidos encontrados`,
     );
 
     res.json(
-      allOrders.map((o) => ({
+      enrichedOrders.map((o) => ({
         ...o,
         items: parseJSON(o.items),
         total: parseFloat(o.total),
@@ -4953,11 +5306,12 @@ app.get("/api/orders/history", async (req, res) => {
     if (start) query = query.where("timestamp", ">=", start);
     if (end) query = query.where("timestamp", "<=", end);
     const orders = await query;
+    const enrichedOrders = await enrichOrdersWithDelivery(orders);
     console.log(
       `📋 [GET /api/orders/history] Encontrados ${orders.length} pedidos`,
     );
     const userIds = [
-      ...new Set(orders.map((order) => order.userId).filter(Boolean)),
+      ...new Set(enrichedOrders.map((order) => order.userId).filter(Boolean)),
     ];
     const usersById = new Map();
     if (userIds.length > 0) {
@@ -4965,7 +5319,7 @@ app.get("/api/orders/history", async (req, res) => {
       users.forEach((user) => usersById.set(user.id, user));
     }
     const currentMonth = toYearMonth();
-    const parsedOrders = orders.map((o) => ({
+    const parsedOrders = enrichedOrders.map((o) => ({
       ...o,
       items: typeof o.items === "string" ? JSON.parse(o.items) : o.items,
       total: parseFloat(o.total),
@@ -5058,10 +5412,11 @@ app.get("/api/orders/:id", async (req, res) => {
     if (!order) {
       return res.status(404).json({ error: "Pedido não encontrado" });
     }
+    const [enriched] = await enrichOrdersWithDelivery([order]);
     res.json({
-      ...order,
-      items: parseJSON(order.items),
-      total: parseFloat(order.total),
+      ...enriched,
+      items: parseJSON(enriched.items),
+      total: parseFloat(enriched.total),
     });
   } catch (e) {
     res.status(500).json({ error: "Erro ao buscar pedido" });
@@ -7425,7 +7780,8 @@ app.get("/api/super-admin/sales-history", async (req, res) => {
 app.get("/api/orders", async (req, res) => {
   try {
     const orders = await db("orders").orderBy("timestamp", "desc");
-    const parsedOrders = orders.map((o) => ({
+    const enrichedOrders = await enrichOrdersWithDelivery(orders);
+    const parsedOrders = enrichedOrders.map((o) => ({
       ...o,
       items: typeof o.items === "string" ? JSON.parse(o.items) : o.items,
       total: parseFloat(o.total),
