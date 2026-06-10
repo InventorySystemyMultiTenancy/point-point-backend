@@ -67,7 +67,7 @@ const restoreDeductedStock = async (items) => {
     if (!productId || quantity <= 0) continue;
 
     const product = await db("products").where({ id: productId }).first();
-    if (!product || product.stock === null || product.stock === undefined) {
+    if (!product) {
       continue;
     }
 
@@ -180,7 +180,7 @@ const expireOrders = cron.schedule("*/10 * * * *", async () => {
           const quantity = getItemQuantity(item, 0);
           const product = await db("products").where({ id: productId }).first();
 
-          if (product && product.stock !== null && product.stock_reserved > 0) {
+          if (product && product.stock_reserved > 0) {
             const newReserved = Math.max(
               0,
               product.stock_reserved - quantity

@@ -162,22 +162,17 @@ const BACKORDER_NOTICE =
   "Produto sob encomenda: prazo minimo de espera de 7 dias uteis.";
 
 const getStockAvailable = (product) => {
-  if (!product || product.stock === null || product.stock === undefined) {
-    return null;
-  }
-
-  return Number(product.stock) - (Number(product.stock_reserved) || 0);
+  if (!product) return 0;
+  return (Number(product.stock) || 0) - (Number(product.stock_reserved) || 0);
 };
 
 const getBackorderMeta = (product, quantity = 1) => {
   const stockAvailable = getStockAvailable(product);
   const requestedQuantity = Math.max(0, Number(quantity) || 1);
   const backorderQuantity =
-    stockAvailable === null
-      ? 0
-      : stockAvailable <= 0
-        ? requestedQuantity
-        : Math.max(0, requestedQuantity - stockAvailable);
+    stockAvailable <= 0
+      ? requestedQuantity
+      : Math.max(0, requestedQuantity - stockAvailable);
 
   return {
     stockAvailable,
@@ -319,7 +314,7 @@ const adjustStockForOrderItems = async (query, items, direction = -1) => {
     }
 
     const product = await query("products").where({ id: productId }).first();
-    if (!product || product.stock === null || product.stock === undefined) {
+    if (!product) {
       continue;
     }
 
@@ -361,18 +356,13 @@ const normalizeProductResponse = (product) => {
         : 0,
     imageUrl: normalizedImages[0] || product.imageUrl || null,
     images: normalizedImages,
+    stock: Number(product.stock) || 0,
     stock_reserved: Number(product.stock_reserved) || 0,
     stock_available: stockAvailable,
     isAvailable: true,
-    isBackorder: stockAvailable !== null && stockAvailable <= 0,
-    backorderQuantity:
-      stockAvailable !== null && stockAvailable < 0
-        ? Math.abs(stockAvailable)
-        : 0,
-    backorderNotice:
-      stockAvailable !== null && stockAvailable <= 0
-        ? BACKORDER_NOTICE
-        : null,
+    isBackorder: stockAvailable <= 0,
+    backorderQuantity: stockAvailable < 0 ? Math.abs(stockAvailable) : 0,
+    backorderNotice: stockAvailable <= 0 ? BACKORDER_NOTICE : null,
   };
 };
 
@@ -432,6 +422,11 @@ const toPositiveNumber = (value) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
+const toStockNumber = (value) => {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
 const toJsonText = (value) =>
   value === undefined || value === null ? null : JSON.stringify(value);
 
@@ -486,15 +481,6 @@ const normalizeOutsourcedProductItems = async (
     if (!product) {
       throw validationError(`Produto ${productId} nao encontrado.`);
     }
-    if (
-      requireStockControlled &&
-      (product.stock === null || product.stock === undefined)
-    ) {
-      throw validationError(
-        `Produto ${product.name || productId} nao tem estoque controlado.`,
-      );
-    }
-
     normalized.push({
       productId,
       id: productId,
@@ -785,7 +771,7 @@ async function initDatabase() {
       table.string("imageUrl"); // URL da imagem do produto
       table.text("images"); // Lista de URLs das imagens (JSON)
       table.boolean("popular").defaultTo(false);
-      table.integer("stock"); // NULL = estoque ilimitado, 0 = esgotado
+      table.integer("stock").defaultTo(0); // 0 = sem estoque; compras podem deixar negativo
       table.integer("stock_reserved").defaultTo(0); // Estoque reservado temporariamente
       table.boolean("active").notNullable().defaultTo(true);
       table.integer("quantidadeVenda").defaultTo(1);
@@ -844,10 +830,11 @@ async function initDatabase() {
     const hasStock = await db.schema.hasColumn("products", "stock");
     if (!hasStock) {
       await db.schema.table("products", (table) => {
-        table.integer("stock");
+        table.integer("stock").defaultTo(0);
       });
       console.log("✅ Coluna stock adicionada à tabela products");
     }
+    await db("products").whereNull("stock").update({ stock: 0 });
     const hasImages = await db.schema.hasColumn("products", "images");
     if (!hasImages) {
       await db.schema.table("products", (table) => {
@@ -2530,7 +2517,7 @@ app.post(
           const product = await trx("products")
             .where({ id: item.productId })
             .first();
-          if (product && product.stock !== null && product.stock !== undefined) {
+          if (product) {
             await trx("products")
               .where({ id: item.productId })
               .update({
@@ -2847,10 +2834,7 @@ app.get(
           name: product.name || "Produto",
           unitCost: Number(product.priceRaw) || 0,
           category: product.category || "Outros",
-          stock:
-            product.stock === null || product.stock === undefined
-              ? null
-              : Number(product.stock),
+          stock: Number(product.stock) || 0,
           minStock: Number(product.minStock) || 0,
         });
       });
@@ -3070,10 +3054,7 @@ app.get(
           ...product,
           revenue: Number(product.revenue.toFixed(2)),
           grossProfit: Number(product.grossProfit.toFixed(2)),
-          stock:
-            product.stock === null || product.stock === undefined
-              ? null
-              : Number(product.stock),
+          stock: Number(product.stock) || 0,
           minStock: Number(product.minStock) || 0,
         }));
 
@@ -3148,12 +3129,9 @@ app.get(
       const stockAlerts = [];
       productRows.forEach((product) => {
         const productId = String(product.id);
-        const stock =
-          product.stock === null || product.stock === undefined
-            ? null
-            : Number(product.stock);
+        const stock = Number(product.stock) || 0;
 
-        if (stock === null || Number.isNaN(stock)) {
+        if (Number.isNaN(stock)) {
           return;
         }
 
@@ -3393,7 +3371,7 @@ app.post(
         ),
         videoUrl: videoUrl || "",
         popular: popular || false,
-        stock: stock !== undefined ? parseInt(stock) : null, // null = ilimitado
+        stock: stock !== undefined && stock !== null ? toStockNumber(stock) : 0,
         minStock: minStock !== undefined ? parseInt(minStock) : 0,
         quantidadeVenda:
           req.body.quantidadeVenda !== undefined
@@ -3459,7 +3437,7 @@ app.put(
       if (videoUrl !== undefined) updates.videoUrl = videoUrl;
       if (popular !== undefined) updates.popular = popular;
       if (stock !== undefined)
-        updates.stock = stock === null ? null : parseInt(stock);
+        updates.stock = stock === null ? 0 : toStockNumber(stock);
 
       if (minStock !== undefined) updates.minStock = parseInt(minStock);
       if (active !== undefined) updates.active = !!active;
@@ -4117,7 +4095,7 @@ app.post("/api/orders", async (req, res) => {
               quantity,
               precoBruto:
                 item.precoBruto !== undefined ? Number(item.precoBruto) : 0,
-              stockAtOrder: product?.stock ?? null,
+              stockAtOrder: Number(product?.stock) || 0,
               stockAvailableAtOrder: backorderMeta.stockAvailable,
               isBackorder: backorderMeta.isBackorder,
               backorderQuantity: backorderMeta.backorderQuantity,
@@ -4478,7 +4456,7 @@ app.delete(
           const productId = getItemProductId(item);
           const product = await db("products").where({ id: productId }).first();
 
-          if (product && product.stock !== null && product.stock_reserved > 0) {
+          if (product && product.stock_reserved > 0) {
             const newReserved = Math.max(
               0,
               product.stock_reserved - getItemQuantity(item, 0),
@@ -4573,7 +4551,7 @@ app.delete(
           }
 
           const product = await trx("products").where({ id: productId }).first();
-          if (!product || product.stock === null) {
+          if (!product) {
             continue;
           }
 
@@ -4826,7 +4804,6 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                   .first();
                 if (
                   product &&
-                  product.stock !== null &&
                   product.stock_reserved > 0
                 ) {
                   const newReserved = Math.max(
@@ -4954,7 +4931,6 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                       .first();
                     if (
                       product &&
-                      product.stock !== null &&
                       product.stock_reserved > 0
                     ) {
                       const newReserved = Math.max(
@@ -5080,7 +5056,6 @@ app.post("/api/notifications/mercadopago", async (req, res) => {
                   .first();
                 if (
                   product &&
-                  product.stock !== null &&
                   product.stock_reserved > 0
                 ) {
                   const newReserved = Math.max(
@@ -5829,7 +5804,6 @@ app.get("/api/payment/status/:paymentId", async (req, res) => {
                   .first();
                 if (
                   product &&
-                  product.stock !== null &&
                   product.stock_reserved > 0
                 ) {
                   const newReserved = Math.max(
@@ -6276,7 +6250,7 @@ app.post("/api/ai/suggestion", async (req, res) => {
       .map(
         (p) =>
           `- ${p.name} (${p.category}) - R$ ${p.price}${
-            p.stock !== null && p.stock <= 0 ? " - sob encomenda" : ""
+            Number(p.stock) <= 0 ? " - sob encomenda" : ""
           } ${
             p.description ? "- " + p.description : ""
           }`,
@@ -6816,7 +6790,7 @@ app.get("/api/ai/inventory-analysis", async (req, res) => {
         name: p.name,
         category: p.category,
         price: p.price,
-        stock: p.stock === null ? "ilimitado" : p.stock,
+        stock: Number(p.stock) || 0,
         totalSold: p.totalSold,
         revenue: p.revenue.toFixed(2),
         averagePerOrder:
@@ -6895,11 +6869,11 @@ Seja direto, prático e use emojis. Priorize ações que o administrador pode to
         totalOrders: analysisData.totalOrders,
         totalRevenue: analysisData.totalRevenue,
         averageOrderValue: analysisData.averageOrderValue,
-        lowStock: products.filter((p) => p.stock !== null && p.stock <= 5)
+        lowStock: products.filter((p) => Number(p.stock) <= 5)
           .length,
         outOfStock: products.filter((p) => p.stock === 0).length,
         backorderedProducts: products.filter(
-          (p) => p.stock !== null && Number(p.stock) < 0,
+          (p) => Number(p.stock) < 0,
         ).length,
       },
       analysis: analysis,
