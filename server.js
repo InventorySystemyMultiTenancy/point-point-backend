@@ -227,6 +227,14 @@ const userHasFullAccess = (user) => isTruthyDb(user?.fullAccess);
 const resolveCatalogFullAccess = async (req) => {
   if (hasAdminCatalogAccess(req)) return true;
 
+  const userId = resolveRequestUserId(req);
+  if (!userId) return false;
+
+  const user = await db("users").where({ id: String(userId) }).first();
+  return userHasFullAccess(user);
+};
+
+const resolveRequestUserId = (req) => {
   const token = getBearerToken(req);
   let tokenUserId = null;
   if (token && JWT_SECRET) {
@@ -237,11 +245,94 @@ const resolveCatalogFullAccess = async (req) => {
     }
   }
 
-  const userId = tokenUserId || req.query.userId || req.headers["x-user-id"];
-  if (!userId) return false;
+  return tokenUserId || req.query.userId || req.headers["x-user-id"] || null;
+};
 
+const normalizePriceValue = (value) => {
+  const price = Number(value);
+  return Number.isFinite(price) && price >= 0 ? price : null;
+};
+
+const getUserProductPriceMap = async (userId, productIds = null, query = db) => {
+  if (!userId) return new Map();
+
+  let pricesQuery = query("user_product_prices").where({
+    userId: String(userId),
+  });
+
+  if (Array.isArray(productIds) && productIds.length > 0) {
+    pricesQuery = pricesQuery.whereIn(
+      "productId",
+      [...new Set(productIds.map(String))],
+    );
+  }
+
+  const rows = await pricesQuery;
+  return new Map(
+    rows.map((row) => [
+      String(row.productId),
+      {
+        customPrice: Number(row.price),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      },
+    ]),
+  );
+};
+
+const applyUserProductPrices = async (products, userId) => {
+  if (!userId || !Array.isArray(products) || products.length === 0) {
+    return products;
+  }
+
+  const priceMap = await getUserProductPriceMap(
+    userId,
+    products.map((product) => product.id),
+  );
+
+  return products.map((product) => {
+    const custom = priceMap.get(String(product.id));
+    if (!custom) return product;
+
+    return {
+      ...product,
+      basePrice: product.price,
+      price: custom.customPrice,
+      customPrice: custom.customPrice,
+      hasCustomPrice: true,
+    };
+  });
+};
+
+const getUserProductPricesPayload = async (userId) => {
   const user = await db("users").where({ id: String(userId) }).first();
-  return userHasFullAccess(user);
+  if (!user) {
+    throw Object.assign(new Error("Usuário não encontrado"), {
+      statusCode: 404,
+    });
+  }
+
+  const products = await db("products").select("*").orderBy("name", "asc");
+  const priceMap = await getUserProductPriceMap(userId);
+
+  return {
+    user: normalizeUserResponse(user),
+    products: products.map((product) => {
+      const custom = priceMap.get(String(product.id));
+      return normalizeProductResponse({
+        ...product,
+        basePrice: product.price,
+        customPrice: custom?.customPrice ?? null,
+        hasCustomPrice: !!custom,
+      });
+    }),
+    customPrices: [...priceMap.entries()].map(([productId, custom]) => ({
+      productId,
+      price: custom.customPrice,
+      created_at: custom.created_at,
+      updated_at: custom.updated_at,
+    })),
+  };
 };
 
 const normalizeUserResponse = (user) => ({
@@ -350,6 +441,17 @@ const normalizeProductResponse = (product) => {
   return {
     ...product,
     price: product.price !== undefined ? parseFloat(product.price) : 0,
+    basePrice:
+      product.basePrice !== undefined && product.basePrice !== null
+        ? parseFloat(product.basePrice)
+        : product.price !== undefined
+          ? parseFloat(product.price)
+          : 0,
+    customPrice:
+      product.customPrice !== undefined && product.customPrice !== null
+        ? parseFloat(product.customPrice)
+        : null,
+    hasCustomPrice: isTruthyDb(product.hasCustomPrice),
     priceRaw:
       product.priceRaw !== undefined && product.priceRaw !== null
         ? parseFloat(product.priceRaw)
@@ -913,6 +1015,30 @@ async function initDatabase() {
       });
       console.log(`Coluna '${col.name}' adicionada a tabela users`);
     }
+  }
+
+  const hasUserProductPrices = await db.schema.hasTable("user_product_prices");
+  if (!hasUserProductPrices) {
+    await db.schema.createTable("user_product_prices", (table) => {
+      table.increments("id").primary();
+      table
+        .string("userId")
+        .notNullable()
+        .references("id")
+        .inTable("users")
+        .onDelete("CASCADE");
+      table
+        .string("productId")
+        .notNullable()
+        .references("id")
+        .inTable("products")
+        .onDelete("CASCADE");
+      table.decimal("price", 12, 2).notNullable();
+      table.timestamp("created_at").defaultTo(db.fn.now());
+      table.timestamp("updated_at").defaultTo(db.fn.now());
+      table.unique(["userId", "productId"]);
+    });
+    console.log("Tabela 'user_product_prices' criada com sucesso");
   }
 
   const hasOrders = await db.schema.hasTable("orders");
@@ -1597,12 +1723,16 @@ app.post("/api/auth/login", async (req, res) => {
 app.get("/api/menu", async (req, res) => {
   try {
     const hasFullAccess = await resolveCatalogFullAccess(req);
+    const catalogUserId = resolveRequestUserId(req);
     // SINGLE-TENANT: Retorna todos os produtos
     const products = await db("products")
       .select("*")
       .where({ active: true })
       .orderBy("id");
-    const visibleProducts = filterCatalogProducts(products, hasFullAccess);
+    const visibleProducts = await applyUserProductPrices(
+      filterCatalogProducts(products, hasFullAccess),
+      catalogUserId,
+    );
     console.log(
       `✅ [GET /api/menu] Retornando ${products.length} produtos (single-tenant)`,
     );
@@ -3315,8 +3445,12 @@ app.get(
   async (req, res) => {
     try {
       const hasFullAccess = await resolveCatalogFullAccess(req);
+      const catalogUserId = resolveRequestUserId(req);
       const products = await db("products").select("*").orderBy("id");
-      const visibleProducts = filterCatalogProducts(products, hasFullAccess);
+      const visibleProducts = await applyUserProductPrices(
+        filterCatalogProducts(products, hasFullAccess),
+        catalogUserId,
+      );
       res.json(visibleProducts.map(normalizeProductResponse));
     } catch (e) {
       console.error("Erro ao buscar todos os produtos:", e);
@@ -3779,6 +3913,179 @@ app.patch(
   },
 );
 
+app.get(
+  "/api/users/:id/product-prices",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const payload = await getUserProductPricesPayload(req.params.id);
+      res.json(payload);
+    } catch (e) {
+      console.error("Erro ao buscar preços personalizados:", e);
+      res
+        .status(e.statusCode || 500)
+        .json({ error: e.message || "Erro ao buscar preços personalizados" });
+    }
+  },
+);
+
+app.put(
+  "/api/users/:id/product-prices",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+    const { prices } = req.body;
+
+    if (!Array.isArray(prices)) {
+      return res.status(400).json({
+        error: "prices deve ser uma lista de { productId, price }",
+      });
+    }
+
+    try {
+      const user = await db("users").where({ id }).first();
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
+
+      const productIds = [
+        ...new Set(prices.map((item) => String(item?.productId || ""))),
+      ].filter(Boolean);
+
+      if (productIds.length === 0) {
+        return res.status(400).json({ error: "Informe ao menos um produto" });
+      }
+
+      const existingProducts = await db("products").whereIn("id", productIds);
+      const existingIds = new Set(existingProducts.map((product) => product.id));
+      const missingIds = productIds.filter((productId) => !existingIds.has(productId));
+      if (missingIds.length > 0) {
+        return res.status(404).json({
+          error: `Produto(s) não encontrado(s): ${missingIds.join(", ")}`,
+        });
+      }
+
+      const now = new Date();
+      await db.transaction(async (trx) => {
+        for (const item of prices) {
+          const productId = String(item?.productId || "");
+          if (!productId) continue;
+
+          if (item.price === null || item.price === undefined || item.price === "") {
+            await trx("user_product_prices")
+              .where({ userId: id, productId })
+              .del();
+            continue;
+          }
+
+          const price = normalizePriceValue(item.price);
+          if (price === null) {
+            throw validationError(
+              `Preço inválido para o produto ${productId}. Use valor maior ou igual a zero.`,
+            );
+          }
+
+          await trx("user_product_prices")
+            .insert({
+              userId: id,
+              productId,
+              price,
+              created_at: now,
+              updated_at: now,
+            })
+            .onConflict(["userId", "productId"])
+            .merge({
+              price,
+              updated_at: now,
+            });
+        }
+      });
+
+      const payload = await getUserProductPricesPayload(id);
+      res.json({ success: true, ...payload });
+    } catch (e) {
+      console.error("Erro ao salvar preços personalizados:", e);
+      res.status(e.statusCode || 500).json({
+        error: e.message || "Erro ao salvar preços personalizados",
+      });
+    }
+  },
+);
+
+app.put(
+  "/api/users/:id/product-prices/:productId",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id, productId } = req.params;
+    const { price } = req.body;
+
+    try {
+      const user = await db("users").where({ id }).first();
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
+
+      const product = await db("products").where({ id: productId }).first();
+      if (!product) {
+        return res.status(404).json({ error: "Produto não encontrado" });
+      }
+
+      const normalizedPrice = normalizePriceValue(price);
+      if (normalizedPrice === null) {
+        return res.status(400).json({
+          error: "Preço inválido. Use valor maior ou igual a zero.",
+        });
+      }
+
+      const now = new Date();
+      await db("user_product_prices")
+        .insert({
+          userId: id,
+          productId,
+          price: normalizedPrice,
+          created_at: now,
+          updated_at: now,
+        })
+        .onConflict(["userId", "productId"])
+        .merge({
+          price: normalizedPrice,
+          updated_at: now,
+        });
+
+      const payload = await getUserProductPricesPayload(id);
+      res.json({ success: true, ...payload });
+    } catch (e) {
+      console.error("Erro ao salvar preço personalizado:", e);
+      res.status(500).json({
+        error: e.message || "Erro ao salvar preço personalizado",
+      });
+    }
+  },
+);
+
+app.delete(
+  "/api/users/:id/product-prices/:productId",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { id, productId } = req.params;
+
+    try {
+      await db("user_product_prices").where({ userId: id, productId }).del();
+      const payload = await getUserProductPricesPayload(id);
+      res.json({ success: true, ...payload });
+    } catch (e) {
+      console.error("Erro ao remover preço personalizado:", e);
+      res.status(e.statusCode || 500).json({
+        error: e.message || "Erro ao remover preço personalizado",
+      });
+    }
+  },
+);
+
 // Endpoint para listar todos os produtos (admin)
 app.get(
   "/api/products",
@@ -4081,17 +4388,33 @@ app.post("/api/orders", async (req, res) => {
       }
 
       // 3. Garante precoBruto em todos os itens
+      const userProductPriceMap = await getUserProductPriceMap(
+        effectiveUserId,
+        items.map((item) => getItemProductId(item)).filter(Boolean),
+        trx,
+      );
       const itemsWithPrecoBruto = Array.isArray(items)
         ? items.map((item) => {
             const productId = getItemProductId(item);
             const quantity = getItemQuantity(item);
             const product = productsById.get(String(productId));
             const backorderMeta = getBackorderMeta(product, quantity);
+            const customPrice = userProductPriceMap.get(String(productId));
+            const basePrice = Number(product?.price) || 0;
+            const effectivePrice = customPrice
+              ? customPrice.customPrice
+              : item.price !== undefined
+                ? Number(item.price)
+                : basePrice;
 
             return {
               ...item,
               id: productId,
               productId,
+              price: Number.isFinite(effectivePrice) ? effectivePrice : basePrice,
+              basePrice,
+              customPrice: customPrice?.customPrice ?? null,
+              hasCustomPrice: !!customPrice,
               quantity,
               precoBruto:
                 item.precoBruto !== undefined ? Number(item.precoBruto) : 0,
@@ -4103,6 +4426,11 @@ app.post("/api/orders", async (req, res) => {
             };
           })
         : [];
+      const computedOrderTotal = itemsWithPrecoBruto.reduce(
+        (sum, item) =>
+          sum + (Number(item.price) || 0) * getItemQuantity(item, 0),
+        0,
+      );
       const hasBackorder = itemsWithPrecoBruto.some((item) => item.isBackorder);
       const stockMovements = await adjustStockForOrderItems(
         trx,
@@ -4134,7 +4462,7 @@ app.post("/api/orders", async (req, res) => {
         id: `order_${Date.now()}`,
         userId: effectiveUserId,
         userName: trimmedUserName || currentUser?.name || "Cliente",
-        total: total,
+        total: Number(computedOrderTotal.toFixed(2)),
         timestamp: new Date().toISOString(),
         status: isMonthlyDeferredOrder ? "active" : "pending",
         paymentStatus: isMonthlyDeferredOrder ? "monthly_pending" : "pending",
