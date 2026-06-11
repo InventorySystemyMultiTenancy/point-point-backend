@@ -158,6 +158,21 @@ const parseJSON = (data) => {
   return data || [];
 };
 
+const parseSeparationChecklist = (data) => {
+  const parsed = parseJSON(data);
+  return Array.isArray(parsed) || (parsed && typeof parsed === "object")
+    ? parsed
+    : [];
+};
+
+const normalizeOrderResponse = (order) => ({
+  ...order,
+  items: parseJSON(order.items),
+  total: parseFloat(order.total),
+  separationChecklist: parseSeparationChecklist(order.separationChecklist),
+  entregueCliente: isTruthyDb(order.entregueCliente),
+});
+
 const BACKORDER_NOTICE =
   "Produto sob encomenda: prazo minimo de espera de 7 dias uteis.";
 
@@ -1208,6 +1223,8 @@ async function initDatabase() {
       table.timestamp("hiddenAt");
       table.string("hiddenBy");
       table.boolean("entregueCliente").defaultTo(false);
+      table.text("separationChecklist");
+      table.timestamp("separationChecklistUpdatedAt");
       table.timestamp("created_at").defaultTo(db.fn.now());
     });
   }
@@ -1260,6 +1277,21 @@ async function initDatabase() {
       table.boolean("entregueCliente").defaultTo(false);
     });
     console.log("✅ Coluna 'entregueCliente' adicionada à tabela orders");
+  }
+
+  const separationChecklistColumns = [
+    { name: "separationChecklist", type: "text" },
+    { name: "separationChecklistUpdatedAt", type: "timestamp" },
+  ];
+  for (const col of separationChecklistColumns) {
+    const hasCol = await db.schema.hasColumn("orders", col.name);
+    if (!hasCol) {
+      await db.schema.table("orders", (table) => {
+        if (col.type === "text") table.text(col.name);
+        if (col.type === "timestamp") table.timestamp(col.name);
+      });
+      console.log(`Coluna '${col.name}' adicionada a orders`);
+    }
   }
 
   const hasOrderCreatedAtColumn = await db.schema.hasColumn(
@@ -4559,11 +4591,7 @@ app.get(
       }
 
       res.json(
-        orders.map((o) => ({
-          ...o,
-          items: parseJSON(o.items),
-          total: parseFloat(o.total),
-        })),
+        orders.map((o) => normalizeOrderResponse(o)),
       );
     } catch (e) {
       res.status(500).json({ error: "Erro ao buscar pedidos" });
@@ -4768,6 +4796,8 @@ app.post("/api/orders", async (req, res) => {
         monthlyClosedBy: null,
         deliveryMethod: deliveryMeta.value,
         carrierId: selectedCarrierId,
+        separationChecklist: null,
+        separationChecklistUpdatedAt: null,
         created_at: new Date(),
       };
 
@@ -4806,11 +4836,7 @@ app.get("/api/users/:userId/orders", async (req, res) => {
       .orderBy("timestamp", "desc");
     const enrichedOrders = await enrichOrdersWithDelivery(orders);
     res.json(
-      enrichedOrders.map((order) => ({
-        ...order,
-        items: parseJSON(order.items),
-        total: parseFloat(order.total),
-      })),
+      enrichedOrders.map((order) => normalizeOrderResponse(order)),
     );
   } catch (e) {
     console.error("❌ Erro ao buscar pedidos do usuário:", e);
@@ -4862,11 +4888,7 @@ app.patch(
       const [enriched] = await enrichOrdersWithDelivery([updated]);
       res.json({
         success: true,
-        order: {
-          ...enriched,
-          items: parseJSON(enriched.items),
-          total: parseFloat(enriched.total),
-        },
+        order: normalizeOrderResponse(enriched),
       });
     } catch (e) {
       console.error("Erro ao atualizar entrega do pedido:", e);
@@ -4982,7 +5004,14 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
 
 app.put("/api/orders/:id", async (req, res) => {
   const { id } = req.params;
-  let { paymentId, paymentStatus } = req.body;
+  let {
+    paymentId,
+    paymentStatus,
+    separationChecklist,
+    checklist,
+    status,
+    entregueCliente,
+  } = req.body || {};
   // Importa serviço de pagamento para validação
   const { checkPaymentStatus } = await import("./services/paymentService.js");
 
@@ -5014,6 +5043,57 @@ app.put("/api/orders/:id", async (req, res) => {
     const updates = {};
     if (paymentId !== undefined) updates.paymentId = paymentId;
     if (paymentStatus) updates.paymentStatus = paymentStatus;
+
+    const checklistPayload =
+      separationChecklist !== undefined ? separationChecklist : checklist;
+    if (checklistPayload !== undefined) {
+      const isValidChecklist =
+        checklistPayload === null ||
+        Array.isArray(checklistPayload) ||
+        typeof checklistPayload === "object";
+
+      if (!isValidChecklist) {
+        return res.status(400).json({
+          error: "separationChecklist deve ser um array, objeto ou null",
+        });
+      }
+
+      updates.separationChecklist = JSON.stringify(checklistPayload || []);
+      updates.separationChecklistUpdatedAt = new Date();
+    }
+
+    if (status !== undefined) {
+      const normalizedStatus = String(status).trim();
+      const allowedStatuses = new Set([
+        "pending",
+        "pending_payment",
+        "active",
+        "preparing",
+        "ready",
+        "delivered",
+        "completed",
+        "canceled",
+        "cancelled",
+        "expired",
+      ]);
+
+      if (!allowedStatuses.has(normalizedStatus)) {
+        return res.status(400).json({ error: "Status de pedido invalido" });
+      }
+
+      updates.status = normalizedStatus;
+      if (["delivered", "completed"].includes(normalizedStatus)) {
+        updates.entregueCliente = true;
+        if (!order.completedAt) updates.completedAt = new Date();
+      }
+    }
+
+    if (entregueCliente !== undefined) {
+      updates.entregueCliente = isTruthyDb(entregueCliente);
+      if (updates.entregueCliente && !order.completedAt) {
+        updates.completedAt = new Date();
+      }
+    }
 
     // 🎯 Validação real do pagamento antes de liberar pedido
     let isPaymentApproved = false;
@@ -5083,9 +5163,7 @@ app.put("/api/orders/:id", async (req, res) => {
     console.log(`✅ Pedido ${id} atualizado!`);
 
     res.json({
-      ...updated,
-      items: parseJSON(updated.items),
-      total: parseFloat(updated.total),
+      ...normalizeOrderResponse(updated),
     });
   } catch (e) {
     console.error("❌ Erro ao atualizar pedido:", e);
@@ -5184,11 +5262,7 @@ app.get("/api/user-orders", async (req, res) => {
     );
 
     res.json(
-      enrichedOrders.map((o) => ({
-        ...o,
-        items: parseJSON(o.items),
-        total: parseFloat(o.total),
-      })),
+      enrichedOrders.map((o) => normalizeOrderResponse(o)),
     );
   } catch (err) {
     console.error("❌ Erro em /api/user-orders:", err);
@@ -5320,9 +5394,7 @@ app.get("/api/orders/history", async (req, res) => {
     }
     const currentMonth = toYearMonth();
     const parsedOrders = enrichedOrders.map((o) => ({
-      ...o,
-      items: typeof o.items === "string" ? JSON.parse(o.items) : o.items,
-      total: parseFloat(o.total),
+      ...normalizeOrderResponse(o),
       monthlyBilling: isTruthyDb(o.monthlyBilling),
       userMonthlyPayment: userHasMonthlyPayment(usersById.get(o.userId)),
       canMonthlyClose:
@@ -5413,11 +5485,7 @@ app.get("/api/orders/:id", async (req, res) => {
       return res.status(404).json({ error: "Pedido não encontrado" });
     }
     const [enriched] = await enrichOrdersWithDelivery([order]);
-    res.json({
-      ...enriched,
-      items: parseJSON(enriched.items),
-      total: parseFloat(enriched.total),
-    });
+    res.json(normalizeOrderResponse(enriched));
   } catch (e) {
     res.status(500).json({ error: "Erro ao buscar pedido" });
   }
@@ -7781,11 +7849,7 @@ app.get("/api/orders", async (req, res) => {
   try {
     const orders = await db("orders").orderBy("timestamp", "desc");
     const enrichedOrders = await enrichOrdersWithDelivery(orders);
-    const parsedOrders = enrichedOrders.map((o) => ({
-      ...o,
-      items: typeof o.items === "string" ? JSON.parse(o.items) : o.items,
-      total: parseFloat(o.total),
-    }));
+    const parsedOrders = enrichedOrders.map((o) => normalizeOrderResponse(o));
     res.json(parsedOrders);
   } catch (e) {
     res.status(500).json({ error: "Erro ao buscar pedidos" });

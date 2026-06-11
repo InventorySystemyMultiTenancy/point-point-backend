@@ -293,10 +293,33 @@ router.get("/super-admin/receivables", superAdminAuth, async (req, res) => {
 router.put("/orders/:id/mark-delivered", async (req, res) => {
   try {
     const { id } = req.params;
+    const checklistPayload =
+      req.body?.separationChecklist !== undefined
+        ? req.body.separationChecklist
+        : req.body?.checklist;
+    const updates = { entregueCliente: true };
+
+    if (checklistPayload !== undefined) {
+      const isValidChecklist =
+        checklistPayload === null ||
+        Array.isArray(checklistPayload) ||
+        typeof checklistPayload === "object";
+
+      if (!isValidChecklist) {
+        return res.status(400).json({
+          success: false,
+          error: "separationChecklist deve ser um array, objeto ou null",
+        });
+      }
+
+      updates.separationChecklist = JSON.stringify(checklistPayload || []);
+      updates.separationChecklistUpdatedAt = new Date();
+    }
+
     // Atualiza a coluna entregueCliente para true
     const updated = await db("orders")
       .where({ id })
-      .update({ entregueCliente: true });
+      .update(updates);
     if (updated) {
       return res.json({
         success: true,
