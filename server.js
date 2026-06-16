@@ -215,8 +215,73 @@ const makeCategoryIdFromName = (name) =>
 const isImportedProduct = (product) =>
   normalizeCategoryName(product?.category) === IMPORTED_CATEGORY_NAME;
 
-const filterCatalogProducts = (products, hasFullAccess = false) =>
-  hasFullAccess ? products : products.filter((product) => !isImportedProduct(product));
+const isHiddenProduct = (product) => isTruthyDb(product?.hidden);
+
+const normalizeStringList = (value) => {
+  const parsed = typeof value === "string" ? parseJSON(value) : value;
+  if (!Array.isArray(parsed)) return [];
+  return [
+    ...new Set(
+      parsed
+        .map((item) => {
+          if (typeof item === "string") return item;
+          return item?.id || item?.userId || item?.clientId || "";
+        })
+        .map((item) => String(item).trim())
+        .filter(Boolean),
+    ),
+  ];
+};
+
+const getProductVisibilityMap = async (productIds = null, query = db) => {
+  let visibilityQuery = query("product_visible_users").select(
+    "productId",
+    "userId",
+  );
+
+  if (Array.isArray(productIds) && productIds.length > 0) {
+    visibilityQuery = visibilityQuery.whereIn(
+      "productId",
+      [...new Set(productIds.map(String))],
+    );
+  }
+
+  const rows = await visibilityQuery;
+  const map = new Map();
+  rows.forEach((row) => {
+    const productId = String(row.productId);
+    if (!map.has(productId)) map.set(productId, new Set());
+    map.get(productId).add(String(row.userId));
+  });
+  return map;
+};
+
+const getProductVisibilityPayloadMap = async (productIds = null, query = db) => {
+  const visibilityMap = await getProductVisibilityMap(productIds, query);
+  return new Map(
+    [...visibilityMap.entries()].map(([productId, userIds]) => [
+      productId,
+      [...userIds],
+    ]),
+  );
+};
+
+const filterCatalogProducts = (
+  products,
+  {
+    hasFullAccess = false,
+    isAdminCatalog = false,
+    userId = null,
+    visibilityMap = new Map(),
+  } = {},
+) =>
+  products.filter((product) => {
+    if (!hasFullAccess && isImportedProduct(product)) return false;
+    if (!isHiddenProduct(product)) return true;
+    if (isAdminCatalog) return true;
+    if (!userId) return false;
+    return visibilityMap.get(String(product.id))?.has(String(userId)) || false;
+  });
 
 const getBearerToken = (req) => {
   const authHeader = req.headers["authorization"];
@@ -237,17 +302,30 @@ const hasAdminCatalogAccess = (req) => {
   }
 };
 
-const userHasFullAccess = (user) => isTruthyDb(user?.fullAccess);
-
-const resolveCatalogFullAccess = async (req) => {
-  if (hasAdminCatalogAccess(req)) return true;
-
+const resolveCatalogContext = async (req) => {
+  const isAdminCatalog = hasAdminCatalogAccess(req);
   const userId = resolveRequestUserId(req);
-  if (!userId) return false;
+
+  if (isAdminCatalog) {
+    return { isAdminCatalog, hasFullAccess: true, userId };
+  }
+
+  if (!userId) {
+    return { isAdminCatalog, hasFullAccess: false, userId: null };
+  }
 
   const user = await db("users").where({ id: String(userId) }).first();
-  return userHasFullAccess(user);
+  return {
+    isAdminCatalog,
+    hasFullAccess: userHasFullAccess(user),
+    userId,
+  };
 };
+
+const userHasFullAccess = (user) => isTruthyDb(user?.fullAccess);
+
+const resolveCatalogFullAccess = async (req) =>
+  (await resolveCatalogContext(req)).hasFullAccess;
 
 const resolveRequestUserId = (req) => {
   const token = getBearerToken(req);
@@ -329,6 +407,9 @@ const getUserProductPricesPayload = async (userId) => {
 
   const products = await db("products").select("*").orderBy("name", "asc");
   const priceMap = await getUserProductPriceMap(userId);
+  const visibilityPayloadMap = await getProductVisibilityPayloadMap(
+    products.map((product) => product.id),
+  );
 
   return {
     user: normalizeUserResponse(user),
@@ -336,6 +417,7 @@ const getUserProductPricesPayload = async (userId) => {
       const custom = priceMap.get(String(product.id));
       return normalizeProductResponse({
         ...product,
+        visibleUserIds: visibilityPayloadMap.get(String(product.id)) || [],
         basePrice: product.price,
         customPrice: custom?.customPrice ?? null,
         hasCustomPrice: !!custom,
@@ -550,6 +632,8 @@ const normalizeProductResponse = (product) => {
 
   return {
     ...product,
+    hidden: isHiddenProduct(product),
+    visibleUserIds: normalizeStringList(product.visibleUserIds),
     price: product.price !== undefined ? parseFloat(product.price) : 0,
     basePrice:
       product.basePrice !== undefined && product.basePrice !== null
@@ -576,6 +660,46 @@ const normalizeProductResponse = (product) => {
     backorderQuantity: stockAvailable < 0 ? Math.abs(stockAvailable) : 0,
     backorderNotice: stockAvailable <= 0 ? BACKORDER_NOTICE : null,
   };
+};
+
+const getProductVisibleUserIdsFromBody = (body) =>
+  normalizeStringList(
+    body?.visibleUserIds ??
+      body?.allowedUserIds ??
+      body?.clientIds ??
+      body?.clients ??
+      body?.users,
+  );
+
+const saveProductVisibility = async (
+  productId,
+  hidden,
+  visibleUserIds,
+  query = db,
+) => {
+  await query("product_visible_users").where({ productId }).del();
+
+  if (!hidden) return;
+  if (!Array.isArray(visibleUserIds) || visibleUserIds.length === 0) {
+    throw validationError("Selecione ao menos um cliente para o produto oculto.");
+  }
+
+  const existingUsers = await query("users")
+    .whereIn("id", visibleUserIds)
+    .select("id");
+  const existingIds = new Set(existingUsers.map((user) => String(user.id)));
+  const missingIds = visibleUserIds.filter((userId) => !existingIds.has(userId));
+  if (missingIds.length > 0) {
+    throw validationError(`Cliente(s) nao encontrado(s): ${missingIds.join(", ")}`);
+  }
+
+  await query("product_visible_users").insert(
+    visibleUserIds.map((userId) => ({
+      productId,
+      userId,
+      created_at: new Date(),
+    })),
+  );
 };
 
 const OUTSOURCED_SERVICE_TYPES = {
@@ -623,6 +747,64 @@ const OUTSOURCED_SERVICE_TYPE_ALIASES = {
 
 const OUTSOURCED_SERVICE_RETENTION_DAYS = 60;
 
+const makeServiceTypeIdFromLabel = (label) =>
+  `service_${String(label || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")}_${Date.now()}`;
+
+const normalizeOutsourcedServiceType = (type) =>
+  type
+    ? {
+        value: type.id || type.value,
+        id: type.id || type.value,
+        label: type.label,
+        inputUnit: type.input_unit || type.inputUnit,
+        outputUnit: type.output_unit || type.outputUnit,
+        inputMode: type.input_mode || type.inputMode,
+        outputMode: type.output_mode || type.outputMode,
+        active: type.active === undefined ? true : isTruthyDb(type.active),
+        builtIn: isTruthyDb(type.built_in ?? type.builtIn),
+        created_at: type.created_at || null,
+        updated_at: type.updated_at || null,
+      }
+    : null;
+
+const getOutsourcedServiceTypes = async (
+  { includeInactive = false } = {},
+  query = db,
+) => {
+  if (!(await query.schema.hasTable("outsourced_service_types"))) {
+    return Object.entries(OUTSOURCED_SERVICE_TYPES).map(([id, config]) =>
+      normalizeOutsourcedServiceType({
+        id,
+        ...config,
+        input_unit: config.inputUnit,
+        output_unit: config.outputUnit,
+        input_mode: config.inputMode,
+        output_mode: config.outputMode,
+        active: true,
+        built_in: true,
+      }),
+    );
+  }
+
+  const typeQuery = query("outsourced_service_types").select("*");
+  if (!includeInactive) typeQuery.where({ active: true });
+  const rows = await typeQuery.orderBy("label", "asc");
+  return rows.map(normalizeOutsourcedServiceType);
+};
+
+const getOutsourcedServiceTypeMap = async (
+  { includeInactive = true } = {},
+  query = db,
+) => {
+  const types = await getOutsourcedServiceTypes({ includeInactive }, query);
+  return new Map(types.map((type) => [type.value, type]));
+};
+
 const toNumberOrNull = (value) => {
   if (value === undefined || value === null || value === "") return null;
   const parsed = Number(value);
@@ -654,8 +836,14 @@ const toIsoDate = (value) => {
 const getOutsourcedServiceTypeKey = (serviceType) =>
   OUTSOURCED_SERVICE_TYPE_ALIASES[serviceType] || serviceType;
 
-const getOutsourcedServiceTypeConfig = (serviceType) =>
-  OUTSOURCED_SERVICE_TYPES[getOutsourcedServiceTypeKey(serviceType)] || null;
+const getOutsourcedServiceTypeConfig = async (serviceType, query = db) => {
+  const key = getOutsourcedServiceTypeKey(serviceType);
+  const typeMap = await getOutsourcedServiceTypeMap(
+    { includeInactive: true },
+    query,
+  );
+  return typeMap.get(key) || OUTSOURCED_SERVICE_TYPES[key] || null;
+};
 
 const parseOutsourcedItems = (value) => {
   const parsed = parseJSON(value);
@@ -741,11 +929,22 @@ const getOutsourcedServiceStatus = (service) => {
   return delivered >= expected ? "concluido" : "pendente";
 };
 
-const normalizeOutsourcedService = (service) => {
+const normalizeOutsourcedService = (service, typeMap = null) => {
   if (!service) return null;
 
   const serviceTypeKey = getOutsourcedServiceTypeKey(service.service_type);
-  const typeConfig = getOutsourcedServiceTypeConfig(service.service_type) || {};
+  const typeConfig =
+    typeMap?.get(serviceTypeKey) ||
+    normalizeOutsourcedServiceType({
+      id: serviceTypeKey,
+      ...(OUTSOURCED_SERVICE_TYPES[serviceTypeKey] || {}),
+      input_unit: OUTSOURCED_SERVICE_TYPES[serviceTypeKey]?.inputUnit,
+      output_unit: OUTSOURCED_SERVICE_TYPES[serviceTypeKey]?.outputUnit,
+      input_mode: OUTSOURCED_SERVICE_TYPES[serviceTypeKey]?.inputMode,
+      output_mode: OUTSOURCED_SERVICE_TYPES[serviceTypeKey]?.outputMode,
+      active: true,
+    }) ||
+    {};
   const totalDelivered = Number(service.total_delivered_quantity) || 0;
   const expectedReturn = Number(service.expected_return_quantity) || 0;
   const status = getOutsourcedServiceStatus(service);
@@ -785,6 +984,18 @@ const normalizeOutsourcedService = (service) => {
     status,
     is_overdue: !!isOverdue,
   };
+};
+
+const normalizeOutsourcedServiceForRequest = (service, req, typeMap = null) => {
+  const normalized = normalizeOutsourcedService(service, typeMap);
+  if (!normalized || req.user?.role !== "employee") return normalized;
+
+  const {
+    fabric_paid_amount,
+    service_cost_amount,
+    ...employeeVisibleService
+  } = normalized;
+  return employeeVisibleService;
 };
 
 const cleanupExpiredOutsourcedServices = async () => {
@@ -986,6 +1197,7 @@ async function initDatabase() {
       table.integer("stock").defaultTo(0); // 0 = sem estoque; compras podem deixar negativo
       table.integer("stock_reserved").defaultTo(0); // Estoque reservado temporariamente
       table.boolean("active").notNullable().defaultTo(true);
+      table.boolean("hidden").notNullable().defaultTo(false);
       table.integer("quantidadeVenda").defaultTo(1);
       table.integer("minStock").defaultTo(0); // Estoque mínimo
     });
@@ -1061,6 +1273,13 @@ async function initDatabase() {
       });
       console.log("Coluna active adicionada a tabela products");
     }
+    const hasProductHidden = await db.schema.hasColumn("products", "hidden");
+    if (!hasProductHidden) {
+      await db.schema.table("products", (table) => {
+        table.boolean("hidden").notNullable().defaultTo(false);
+      });
+      console.log("Coluna hidden adicionada a tabela products");
+    }
     const hasQuantidadeVenda = await db.schema.hasColumn(
       "products",
       "quantidadeVenda",
@@ -1125,6 +1344,29 @@ async function initDatabase() {
       });
       console.log(`Coluna '${col.name}' adicionada a tabela users`);
     }
+  }
+
+  await db("products").whereNull("hidden").update({ hidden: false });
+
+  if (!(await db.schema.hasTable("product_visible_users"))) {
+    await db.schema.createTable("product_visible_users", (table) => {
+      table.increments("id").primary();
+      table
+        .string("productId")
+        .notNullable()
+        .references("id")
+        .inTable("products")
+        .onDelete("CASCADE");
+      table
+        .string("userId")
+        .notNullable()
+        .references("id")
+        .inTable("users")
+        .onDelete("CASCADE");
+      table.timestamp("created_at").defaultTo(db.fn.now());
+      table.unique(["productId", "userId"]);
+    });
+    console.log("Tabela 'product_visible_users' criada com sucesso");
   }
 
   const hasUserProductPrices = await db.schema.hasTable("user_product_prices");
@@ -1467,6 +1709,62 @@ async function initDatabase() {
       table.timestamp("updated_at").defaultTo(db.fn.now());
     });
     console.log("Tabela 'outsourced_companies' criada com sucesso");
+  }
+
+  if (!(await db.schema.hasTable("outsourced_service_types"))) {
+    await db.schema.createTable("outsourced_service_types", (table) => {
+      table.string("id").primary();
+      table.string("label").notNullable();
+      table.string("input_unit").notNullable();
+      table.string("output_unit").notNullable();
+      table.string("input_mode").notNullable().defaultTo("products");
+      table.string("output_mode").notNullable().defaultTo("products");
+      table.boolean("active").notNullable().defaultTo(true);
+      table.boolean("built_in").notNullable().defaultTo(false);
+      table.timestamp("created_at").defaultTo(db.fn.now());
+      table.timestamp("updated_at").defaultTo(db.fn.now());
+    });
+    console.log("Tabela 'outsourced_service_types' criada com sucesso");
+  }
+
+  const outsourcedServiceTypeColumns = [
+    { name: "input_unit", type: "string" },
+    { name: "output_unit", type: "string" },
+    { name: "input_mode", type: "string" },
+    { name: "output_mode", type: "string" },
+    { name: "active", type: "boolean" },
+    { name: "built_in", type: "boolean" },
+    { name: "created_at", type: "timestamp" },
+    { name: "updated_at", type: "timestamp" },
+  ];
+  for (const col of outsourcedServiceTypeColumns) {
+    const hasCol = await db.schema.hasColumn("outsourced_service_types", col.name);
+    if (!hasCol) {
+      await db.schema.table("outsourced_service_types", (table) => {
+        if (col.type === "string") table.string(col.name);
+        if (col.type === "boolean") table.boolean(col.name).defaultTo(false);
+        if (col.type === "timestamp") table.timestamp(col.name);
+      });
+      console.log(`Coluna ${col.name} adicionada a outsourced_service_types`);
+    }
+  }
+
+  for (const [id, config] of Object.entries(OUTSOURCED_SERVICE_TYPES)) {
+    const exists = await db("outsourced_service_types").where({ id }).first();
+    if (!exists) {
+      await db("outsourced_service_types").insert({
+        id,
+        label: config.label,
+        input_unit: config.inputUnit,
+        output_unit: config.outputUnit,
+        input_mode: config.inputMode,
+        output_mode: config.outputMode,
+        active: true,
+        built_in: true,
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+    }
   }
 
   if (!(await db.schema.hasTable("outsourced_services"))) {
@@ -1894,16 +2192,21 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/menu", async (req, res) => {
   try {
-    const hasFullAccess = await resolveCatalogFullAccess(req);
-    const catalogUserId = resolveRequestUserId(req);
+    const catalogContext = await resolveCatalogContext(req);
     // SINGLE-TENANT: Retorna todos os produtos
     const products = await db("products")
       .select("*")
       .where({ active: true })
       .orderBy("id");
+    const visibilityMap = await getProductVisibilityMap(
+      products.map((product) => product.id),
+    );
     const visibleProducts = await applyUserProductPrices(
-      filterCatalogProducts(products, hasFullAccess),
-      catalogUserId,
+      filterCatalogProducts(products, {
+        ...catalogContext,
+        visibilityMap,
+      }),
+      catalogContext.userId,
     );
     console.log(
       `✅ [GET /api/menu] Retornando ${products.length} produtos (single-tenant)`,
@@ -2424,13 +2727,157 @@ app.get(
   authenticateToken,
   authorizeOutsourcedAccess,
   async (req, res) => {
+    const includeInactive =
+      req.query.includeInactive === "true" &&
+      (req.user.role === "admin" || req.user.role === "superadmin");
+    const types = await getOutsourcedServiceTypes({ includeInactive });
     res.json({
-      types: Object.entries(OUTSOURCED_SERVICE_TYPES).map(([value, config]) => ({
-        value,
-        ...config,
-      })),
+      types,
       legacyAliases: OUTSOURCED_SERVICE_TYPE_ALIASES,
     });
+  },
+);
+
+app.post(
+  "/api/admin/outsourced-services/types",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const label = String(req.body.label || "").trim();
+      const inputUnit = String(req.body.inputUnit || req.body.input_unit || "").trim();
+      const outputUnit = String(req.body.outputUnit || req.body.output_unit || "").trim();
+      const inputMode = String(req.body.inputMode || req.body.input_mode || "products").trim();
+      const outputMode = String(req.body.outputMode || req.body.output_mode || "products").trim();
+
+      if (!label || !inputUnit || !outputUnit) {
+        return res.status(400).json({
+          error: "label, inputUnit e outputUnit sao obrigatorios",
+        });
+      }
+      if (!["products", "measure"].includes(inputMode)) {
+        return res.status(400).json({ error: "inputMode invalido" });
+      }
+      if (!["products", "measure"].includes(outputMode)) {
+        return res.status(400).json({ error: "outputMode invalido" });
+      }
+
+      const id = req.body.id || req.body.value || makeServiceTypeIdFromLabel(label);
+      const exists = await db("outsourced_service_types").where({ id }).first();
+      if (exists) {
+        return res.status(409).json({ error: "Tipo de servico ja existe" });
+      }
+
+      const now = new Date();
+      const type = {
+        id,
+        label,
+        input_unit: inputUnit,
+        output_unit: outputUnit,
+        input_mode: inputMode,
+        output_mode: outputMode,
+        active: req.body.active === undefined ? true : isTruthyDb(req.body.active),
+        built_in: false,
+        created_at: now,
+        updated_at: now,
+      };
+
+      await db("outsourced_service_types").insert(type);
+      res.status(201).json(normalizeOutsourcedServiceType(type));
+    } catch (e) {
+      console.error("Erro ao cadastrar tipo de servico:", e);
+      res.status(500).json({ error: "Erro ao cadastrar tipo de servico" });
+    }
+  },
+);
+
+app.put(
+  "/api/admin/outsourced-services/types/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const type = await db("outsourced_service_types")
+        .where({ id: req.params.id })
+        .first();
+      if (!type) {
+        return res.status(404).json({ error: "Tipo de servico nao encontrado" });
+      }
+
+      const updates = { updated_at: new Date() };
+      if (req.body.label !== undefined) {
+        const label = String(req.body.label || "").trim();
+        if (!label) return res.status(400).json({ error: "label e obrigatorio" });
+        updates.label = label;
+      }
+      if (req.body.inputUnit !== undefined || req.body.input_unit !== undefined) {
+        const inputUnit = String(req.body.inputUnit ?? req.body.input_unit ?? "").trim();
+        if (!inputUnit) return res.status(400).json({ error: "inputUnit e obrigatorio" });
+        updates.input_unit = inputUnit;
+      }
+      if (req.body.outputUnit !== undefined || req.body.output_unit !== undefined) {
+        const outputUnit = String(req.body.outputUnit ?? req.body.output_unit ?? "").trim();
+        if (!outputUnit) return res.status(400).json({ error: "outputUnit e obrigatorio" });
+        updates.output_unit = outputUnit;
+      }
+      if (req.body.inputMode !== undefined || req.body.input_mode !== undefined) {
+        const inputMode = String(req.body.inputMode ?? req.body.input_mode ?? "").trim();
+        if (!["products", "measure"].includes(inputMode)) {
+          return res.status(400).json({ error: "inputMode invalido" });
+        }
+        updates.input_mode = inputMode;
+      }
+      if (req.body.outputMode !== undefined || req.body.output_mode !== undefined) {
+        const outputMode = String(req.body.outputMode ?? req.body.output_mode ?? "").trim();
+        if (!["products", "measure"].includes(outputMode)) {
+          return res.status(400).json({ error: "outputMode invalido" });
+        }
+        updates.output_mode = outputMode;
+      }
+      if (req.body.active !== undefined) updates.active = isTruthyDb(req.body.active);
+
+      await db("outsourced_service_types").where({ id: req.params.id }).update(updates);
+      const updated = await db("outsourced_service_types")
+        .where({ id: req.params.id })
+        .first();
+      res.json(normalizeOutsourcedServiceType(updated));
+    } catch (e) {
+      console.error("Erro ao atualizar tipo de servico:", e);
+      res.status(500).json({ error: "Erro ao atualizar tipo de servico" });
+    }
+  },
+);
+
+app.delete(
+  "/api/admin/outsourced-services/types/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const type = await db("outsourced_service_types")
+        .where({ id: req.params.id })
+        .first();
+      if (!type) {
+        return res.status(404).json({ error: "Tipo de servico nao encontrado" });
+      }
+
+      const usage = await db("outsourced_services")
+        .where({ service_type: req.params.id })
+        .count("id as count")
+        .first();
+      if (Number(usage.count) > 0) {
+        return res.status(409).json({
+          error: "Nao e possivel excluir um tipo usado em servicos existentes",
+          servicesCount: Number(usage.count),
+        });
+      }
+
+      await db("outsourced_service_types").where({ id: req.params.id }).del();
+      res.json({ success: true });
+    } catch (e) {
+      console.error("Erro ao excluir tipo de servico:", e);
+      res.status(500).json({ error: "Erro ao excluir tipo de servico" });
+    }
   },
 );
 
@@ -2571,7 +3018,12 @@ app.get(
       }
 
       const services = await query;
-      res.json(services.map(normalizeOutsourcedService));
+      const typeMap = await getOutsourcedServiceTypeMap();
+      res.json(
+        services.map((service) =>
+          normalizeOutsourcedServiceForRequest(service, req, typeMap),
+        ),
+      );
     } catch (e) {
       console.error("Erro ao buscar servicos terceirizados:", e);
       res.status(500).json({ error: "Erro ao buscar servicos terceirizados" });
@@ -2592,9 +3044,12 @@ app.get(
         .where("s.due_date", "<", new Date().toISOString())
         .orderBy("s.due_date", "asc");
 
+      const typeMap = await getOutsourcedServiceTypeMap();
       res.json({
         count: services.length,
-        alerts: services.map(normalizeOutsourcedService),
+        alerts: services.map((service) =>
+          normalizeOutsourcedServiceForRequest(service, req, typeMap),
+        ),
       });
     } catch (e) {
       console.error("Erro ao buscar alertas de servicos terceirizados:", e);
@@ -2623,8 +3078,9 @@ app.get(
         .where({ service_id: req.params.id })
         .orderBy("delivered_at", "desc");
 
+      const typeMap = await getOutsourcedServiceTypeMap();
       res.json({
-        ...normalizeOutsourcedService(service),
+        ...normalizeOutsourcedServiceForRequest(service, req, typeMap),
         deliveries: deliveries.map((delivery) => ({
           ...delivery,
           items: parseOutsourcedItems(delivery.items),
@@ -2656,7 +3112,7 @@ app.post(
       }
 
       const serviceType = getOutsourcedServiceTypeKey(req.body.service_type);
-      const typeConfig = getOutsourcedServiceTypeConfig(serviceType);
+      const typeConfig = await getOutsourcedServiceTypeConfig(serviceType);
       if (!typeConfig) {
         return res.status(400).json({ error: "Tipo de servico invalido" });
       }
@@ -2732,11 +3188,16 @@ app.post(
       };
 
       await db("outsourced_services").insert(service);
+      const typeMap = await getOutsourcedServiceTypeMap();
       res.status(201).json(
-        normalizeOutsourcedService({
-          ...service,
-          company_name: company.name,
-        }),
+        normalizeOutsourcedServiceForRequest(
+          {
+            ...service,
+            company_name: company.name,
+          },
+          req,
+          typeMap,
+        ),
       );
     } catch (e) {
       console.error("Erro ao criar servico terceirizado:", e);
@@ -2843,13 +3304,14 @@ app.post(
         .where("s.id", req.params.id)
         .first();
 
+      const typeMap = await getOutsourcedServiceTypeMap();
       res.status(201).json({
         delivery: {
           ...delivery,
           items: deliveryItems,
           quantity: Number(delivery.quantity) || 0,
         },
-        service: normalizeOutsourcedService(updated),
+        service: normalizeOutsourcedServiceForRequest(updated, req, typeMap),
       });
     } catch (e) {
       console.error("Erro ao lancar entrega terceirizada:", e);
@@ -2887,7 +3349,8 @@ app.put(
         .where("s.id", req.params.id)
         .first();
 
-      res.json(normalizeOutsourcedService(updated));
+      const typeMap = await getOutsourcedServiceTypeMap();
+      res.json(normalizeOutsourcedServiceForRequest(updated, req, typeMap));
     } catch (e) {
       console.error("Erro ao finalizar servico terceirizado:", e);
       res.status(500).json({ error: "Erro ao finalizar servico terceirizado" });
@@ -3616,14 +4079,31 @@ app.get(
   "/api/products",
   async (req, res) => {
     try {
-      const hasFullAccess = await resolveCatalogFullAccess(req);
-      const catalogUserId = resolveRequestUserId(req);
+      const catalogContext = await resolveCatalogContext(req);
       const products = await db("products").select("*").orderBy("id");
-      const visibleProducts = await applyUserProductPrices(
-        filterCatalogProducts(products, hasFullAccess),
-        catalogUserId,
+      const visibilityMap = await getProductVisibilityMap(
+        products.map((product) => product.id),
       );
-      res.json(visibleProducts.map(normalizeProductResponse));
+      const visibleProducts = await applyUserProductPrices(
+        filterCatalogProducts(products, {
+          ...catalogContext,
+          visibilityMap,
+        }),
+        catalogContext.userId,
+      );
+      const visibilityPayloadMap = catalogContext.isAdminCatalog
+        ? await getProductVisibilityPayloadMap(
+            visibleProducts.map((product) => product.id),
+          )
+        : new Map();
+      res.json(
+        visibleProducts.map((product) =>
+          normalizeProductResponse({
+            ...product,
+            visibleUserIds: visibilityPayloadMap.get(String(product.id)) || [],
+          }),
+        ),
+      );
     } catch (e) {
       console.error("Erro ao buscar todos os produtos:", e);
       res.status(500).json({ error: "Erro ao buscar produtos" });
@@ -3664,6 +4144,10 @@ app.post(
         : [];
       const primaryImage =
         imageUrl || normalizedImages[0] || "https://picsum.photos/400/300";
+      const productHidden = isTruthyDb(
+        req.body.hidden ?? req.body.isHidden ?? req.body.hiddenProduct,
+      );
+      const visibleUserIds = getProductVisibleUserIdsFromBody(req.body);
 
       const newProduct = {
         id: id || `prod_${Date.now()}`,
@@ -3677,6 +4161,7 @@ app.post(
         ),
         videoUrl: videoUrl || "",
         popular: popular || false,
+        hidden: productHidden,
         stock: stock !== undefined && stock !== null ? toStockNumber(stock) : 0,
         minStock: minStock !== undefined ? parseInt(minStock) : 0,
         quantidadeVenda:
@@ -3685,8 +4170,21 @@ app.post(
             : 1,
       };
 
-      await db("products").insert(newProduct);
-      res.status(201).json(normalizeProductResponse(newProduct));
+      await db.transaction(async (trx) => {
+        await trx("products").insert(newProduct);
+        await saveProductVisibility(
+          newProduct.id,
+          productHidden,
+          visibleUserIds,
+          trx,
+        );
+      });
+      res.status(201).json(
+        normalizeProductResponse({
+          ...newProduct,
+          visibleUserIds: productHidden ? visibleUserIds : [],
+        }),
+      );
     } catch (e) {
       console.error("Erro ao criar produto:", e);
       res.status(500).json({ error: "Erro ao criar produto" });
@@ -3748,16 +4246,52 @@ app.put(
       if (minStock !== undefined) updates.minStock = parseInt(minStock);
       if (active !== undefined) updates.active = !!active;
 
+      const hasHiddenPayload =
+        req.body.hidden !== undefined ||
+        req.body.isHidden !== undefined ||
+        req.body.hiddenProduct !== undefined;
+      const hasVisibleUsersPayload =
+        req.body.visibleUserIds !== undefined ||
+        req.body.allowedUserIds !== undefined ||
+        req.body.clientIds !== undefined ||
+        req.body.clients !== undefined ||
+        req.body.users !== undefined;
+      const nextHidden = hasHiddenPayload
+        ? isTruthyDb(req.body.hidden ?? req.body.isHidden ?? req.body.hiddenProduct)
+        : isHiddenProduct(exists);
+      const currentVisibility = hasVisibleUsersPayload
+        ? null
+        : await getProductVisibilityMap([id]);
+      const visibleUserIds = hasVisibleUsersPayload
+        ? getProductVisibleUserIdsFromBody(req.body)
+        : [...(currentVisibility.get(String(id)) || [])];
+
+      if (hasHiddenPayload) updates.hidden = nextHidden;
+
       if (req.body.quantidadeVenda !== undefined)
         updates.quantidadeVenda = parseInt(req.body.quantidadeVenda);
       // Só atualiza se houver campos para atualizar
-      if (Object.keys(updates).length === 0) {
+      if (Object.keys(updates).length === 0 && !hasVisibleUsersPayload) {
         return res.status(400).json({ error: "Nenhum campo para atualizar." });
       }
-      await db("products").where({ id }).update(updates);
+
+      await db.transaction(async (trx) => {
+        if (Object.keys(updates).length > 0) {
+          await trx("products").where({ id }).update(updates);
+        }
+        if (hasHiddenPayload || hasVisibleUsersPayload) {
+          await saveProductVisibility(id, nextHidden, visibleUserIds, trx);
+        }
+      });
 
       const updated = await db("products").where({ id }).first();
-      res.json(normalizeProductResponse(updated));
+      const updatedVisibility = await getProductVisibilityPayloadMap([id]);
+      res.json(
+        normalizeProductResponse({
+          ...updated,
+          visibleUserIds: updatedVisibility.get(String(id)) || [],
+        }),
+      );
     } catch (e) {
       console.error("Erro ao atualizar produto:", e);
       res.status(500).json({ error: "Erro ao atualizar produto" });
@@ -4391,7 +4925,17 @@ app.get(
   async (req, res) => {
     try {
       const products = await db("products").select("*").orderBy("id");
-      res.json(products.map(normalizeProductResponse));
+      const visibilityPayloadMap = await getProductVisibilityPayloadMap(
+        products.map((product) => product.id),
+      );
+      res.json(
+        products.map((product) =>
+          normalizeProductResponse({
+            ...product,
+            visibleUserIds: visibilityPayloadMap.get(String(product.id)) || [],
+          }),
+        ),
+      );
     } catch (e) {
       console.error("Erro ao buscar todos os produtos:", e);
       res.status(500).json({ error: "Erro ao buscar produtos" });
@@ -4697,6 +5241,14 @@ app.post("/api/orders", async (req, res) => {
           throw new Error(
             `Produto ${product.name || productId} exige acesso completo para compra.`,
           );
+        }
+        if (isHiddenProduct(product)) {
+          const allowedUsers = await getProductVisibilityMap([productId], trx);
+          if (!allowedUsers.get(String(productId))?.has(String(effectiveUserId))) {
+            throw new Error(
+              `Produto ${product.name || productId} nao esta disponivel para este cliente.`,
+            );
+          }
         }
         productsById.set(String(productId), product);
       }
