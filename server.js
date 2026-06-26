@@ -200,6 +200,60 @@ const getBackorderMeta = (product, quantity = 1) => {
 const isTruthyDb = (value) =>
   value === true || value === 1 || value === "1" || value === "true";
 
+const roundCurrency = (value) => Math.round((Number(value) || 0) * 100) / 100;
+
+const getProductCostStepsPayload = (body = {}) =>
+  body.costSteps ??
+  body.costBreakdownSteps ??
+  body.costComposition ??
+  body.custoEtapas ??
+  body.etapasCusto;
+
+const normalizeProductCostSteps = (value, required = false) => {
+  const parsed = typeof value === "string" ? parseJSON(value) : value;
+  if (!Array.isArray(parsed)) {
+    if (!required && (parsed === undefined || parsed === null || parsed === "")) {
+      return [];
+    }
+    const error = new Error("costSteps deve ser uma lista de { step, cost }.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const steps = parsed.map((item, index) => {
+    const step = String(
+      item?.step ?? item?.name ?? item?.etapa ?? item?.descricao ?? "",
+    ).trim();
+    const cost = Number(item?.cost ?? item?.value ?? item?.custo ?? item?.valor);
+
+    if (!step) {
+      const error = new Error(`Informe o nome da etapa ${index + 1}.`);
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!Number.isFinite(cost) || cost < 0) {
+      const error = new Error(
+        `Informe um custo valido maior ou igual a zero para a etapa ${index + 1}.`,
+      );
+      error.statusCode = 400;
+      throw error;
+    }
+
+    return { step, cost: roundCurrency(cost) };
+  });
+
+  if (required && steps.length === 0) {
+    const error = new Error("Informe ao menos uma etapa de custo.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return steps;
+};
+
+const sumProductCostSteps = (steps) =>
+  roundCurrency(steps.reduce((sum, step) => sum + (Number(step.cost) || 0), 0));
+
 const IMPORTED_CATEGORY_NAME = "importados";
 
 const normalizeCategoryName = (category) =>
@@ -628,6 +682,22 @@ const normalizeProductResponse = (product) => {
       : product.imageUrl
         ? [product.imageUrl]
         : [];
+  const parsedCostSteps = parseJSON(product.costSteps);
+  const costBreakdownEnabled = isTruthyDb(
+    product.costBreakdownEnabled ?? product.hasCostBreakdown,
+  );
+  const normalizedCostSteps =
+    costBreakdownEnabled && Array.isArray(parsedCostSteps)
+      ? parsedCostSteps
+          .map((step) => ({
+            step: typeof step?.step === "string" ? step.step : "",
+            cost:
+              step?.cost !== undefined && step?.cost !== null
+                ? parseFloat(step.cost)
+                : 0,
+          }))
+          .filter((step) => step.step && Number.isFinite(step.cost))
+      : [];
   const stockAvailable = getStockAvailable(product);
 
   return {
@@ -650,6 +720,9 @@ const normalizeProductResponse = (product) => {
       product.priceRaw !== undefined && product.priceRaw !== null
         ? parseFloat(product.priceRaw)
         : 0,
+    costBreakdownEnabled,
+    hasCostBreakdown: costBreakdownEnabled,
+    costSteps: normalizedCostSteps,
     imageUrl: normalizedImages[0] || product.imageUrl || null,
     images: normalizedImages,
     stock: Number(product.stock) || 0,
@@ -1198,6 +1271,8 @@ async function initDatabase() {
       table.integer("stock_reserved").defaultTo(0); // Estoque reservado temporariamente
       table.boolean("active").notNullable().defaultTo(true);
       table.boolean("hidden").notNullable().defaultTo(false);
+      table.boolean("costBreakdownEnabled").notNullable().defaultTo(false);
+      table.text("costSteps");
       table.integer("quantidadeVenda").defaultTo(1);
       table.integer("minStock").defaultTo(0); // Estoque mínimo
     });
@@ -1279,6 +1354,23 @@ async function initDatabase() {
         table.boolean("hidden").notNullable().defaultTo(false);
       });
       console.log("Coluna hidden adicionada a tabela products");
+    }
+    const hasCostBreakdownEnabled = await db.schema.hasColumn(
+      "products",
+      "costBreakdownEnabled",
+    );
+    if (!hasCostBreakdownEnabled) {
+      await db.schema.table("products", (table) => {
+        table.boolean("costBreakdownEnabled").notNullable().defaultTo(false);
+      });
+      console.log("Coluna costBreakdownEnabled adicionada a tabela products");
+    }
+    const hasCostSteps = await db.schema.hasColumn("products", "costSteps");
+    if (!hasCostSteps) {
+      await db.schema.table("products", (table) => {
+        table.text("costSteps");
+      });
+      console.log("Coluna costSteps adicionada a tabela products");
     }
     const hasQuantidadeVenda = await db.schema.hasColumn(
       "products",
@@ -4128,6 +4220,8 @@ app.post(
       popular,
       stock,
       minStock,
+      costBreakdownEnabled,
+      hasCostBreakdown,
     } = req.body;
 
     if (!name || !price || !category) {
@@ -4148,12 +4242,34 @@ app.post(
         req.body.hidden ?? req.body.isHidden ?? req.body.hiddenProduct,
       );
       const visibleUserIds = getProductVisibleUserIdsFromBody(req.body);
+      const costStepsPayload = getProductCostStepsPayload(req.body);
+      const hasCostBreakdownPayload =
+        costBreakdownEnabled !== undefined ||
+        hasCostBreakdown !== undefined ||
+        req.body.destrincharCusto !== undefined ||
+        req.body.custoDestrinchado !== undefined;
+      const productCostBreakdownEnabled = hasCostBreakdownPayload
+        ? isTruthyDb(
+            costBreakdownEnabled ??
+              hasCostBreakdown ??
+              req.body.destrincharCusto ??
+              req.body.custoDestrinchado,
+          )
+        : costStepsPayload !== undefined;
+      const costSteps = productCostBreakdownEnabled
+        ? normalizeProductCostSteps(costStepsPayload, true)
+        : [];
+      const calculatedPriceRaw = productCostBreakdownEnabled
+        ? sumProductCostSteps(costSteps)
+        : priceRaw !== undefined
+          ? parseFloat(priceRaw)
+          : 0;
 
       const newProduct = {
         id: id || `prod_${Date.now()}`,
         name,
         price: parseFloat(price),
-        priceRaw: priceRaw !== undefined ? parseFloat(priceRaw) : 0,
+        priceRaw: calculatedPriceRaw,
         category,
         imageUrl: primaryImage,
         images: JSON.stringify(
@@ -4162,6 +4278,8 @@ app.post(
         videoUrl: videoUrl || "",
         popular: popular || false,
         hidden: productHidden,
+        costBreakdownEnabled: productCostBreakdownEnabled,
+        costSteps: JSON.stringify(costSteps),
         stock: stock !== undefined && stock !== null ? toStockNumber(stock) : 0,
         minStock: minStock !== undefined ? parseInt(minStock) : 0,
         quantidadeVenda:
@@ -4187,7 +4305,9 @@ app.post(
       );
     } catch (e) {
       console.error("Erro ao criar produto:", e);
-      res.status(500).json({ error: "Erro ao criar produto" });
+      res
+        .status(e.statusCode || 500)
+        .json({ error: e.statusCode ? e.message : "Erro ao criar produto" });
     }
   },
 );
@@ -4210,6 +4330,8 @@ app.put(
       stock,
       minStock,
       active,
+      costBreakdownEnabled,
+      hasCostBreakdown,
     } = req.body;
 
     try {
@@ -4224,7 +4346,6 @@ app.put(
       const updates = {};
       if (name !== undefined) updates.name = name;
       if (price !== undefined) updates.price = parseFloat(price);
-      if (priceRaw !== undefined) updates.priceRaw = parseFloat(priceRaw);
       if (category !== undefined) updates.category = category;
       if (imageUrl !== undefined) {
         updates.imageUrl = imageUrl;
@@ -4245,6 +4366,38 @@ app.put(
 
       if (minStock !== undefined) updates.minStock = parseInt(minStock);
       if (active !== undefined) updates.active = !!active;
+
+      const costStepsPayload = getProductCostStepsPayload(req.body);
+      const hasCostBreakdownPayload =
+        costBreakdownEnabled !== undefined ||
+        hasCostBreakdown !== undefined ||
+        req.body.destrincharCusto !== undefined ||
+        req.body.custoDestrinchado !== undefined;
+      const hasCostStepsPayload = costStepsPayload !== undefined;
+      if (hasCostBreakdownPayload || hasCostStepsPayload || priceRaw !== undefined) {
+        const nextCostBreakdownEnabled = hasCostBreakdownPayload
+          ? isTruthyDb(
+              costBreakdownEnabled ??
+                hasCostBreakdown ??
+                req.body.destrincharCusto ??
+                req.body.custoDestrinchado,
+            )
+          : hasCostStepsPayload
+            ? true
+            : isTruthyDb(exists.costBreakdownEnabled);
+
+        if (nextCostBreakdownEnabled) {
+          const sourceSteps = hasCostStepsPayload ? costStepsPayload : exists.costSteps;
+          const costSteps = normalizeProductCostSteps(sourceSteps, true);
+          updates.costBreakdownEnabled = true;
+          updates.costSteps = JSON.stringify(costSteps);
+          updates.priceRaw = sumProductCostSteps(costSteps);
+        } else {
+          updates.costBreakdownEnabled = false;
+          updates.costSteps = JSON.stringify([]);
+          if (priceRaw !== undefined) updates.priceRaw = parseFloat(priceRaw);
+        }
+      }
 
       const hasHiddenPayload =
         req.body.hidden !== undefined ||
@@ -4294,7 +4447,9 @@ app.put(
       );
     } catch (e) {
       console.error("Erro ao atualizar produto:", e);
-      res.status(500).json({ error: "Erro ao atualizar produto" });
+      res
+        .status(e.statusCode || 500)
+        .json({ error: e.statusCode ? e.message : "Erro ao atualizar produto" });
     }
   },
 );
