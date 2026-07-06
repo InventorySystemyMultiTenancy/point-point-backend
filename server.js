@@ -288,6 +288,89 @@ const normalizeProductCostSteps = (value, required = false) => {
 const sumProductCostSteps = (steps) =>
   roundCurrency(steps.reduce((sum, step) => sum + (Number(step.cost) || 0), 0));
 
+const getProductFabricUsagePayload = (body = {}) =>
+  body.fabric_usage_items ??
+  body.fabricUsageItems ??
+  body.fabricRequirements ??
+  body.fabric_requirements ??
+  body.tecidosPorUnidade ??
+  body.fabricConsumption;
+
+const normalizeProductFabricUsageItems = (value) => {
+  if (value === undefined || value === null || value === "") return [];
+
+  const parsed = typeof value === "string" ? parseJSON(value) : value;
+  if (!Array.isArray(parsed)) {
+    throw validationError("fabric_usage_items deve ser uma lista.");
+  }
+
+  return parsed.map((item, index) => {
+    const color = String(
+      item?.color ?? item?.cor ?? item?.fabricColor ?? item?.name ?? "",
+    ).trim();
+    const centimeters = Number(
+      item?.centimeters ??
+        item?.centimetersPerUnit ??
+        item?.cmPerUnit ??
+        item?.cm ??
+        item?.amountCm ??
+        item?.quantidadeCm,
+    );
+
+    if (!color) {
+      throw validationError(`Informe a cor do tecido ${index + 1}.`);
+    }
+    if (!Number.isFinite(centimeters) || centimeters <= 0) {
+      throw validationError(
+        `Informe a quantidade em cm maior que zero para o tecido ${index + 1}.`,
+      );
+    }
+
+    return {
+      color,
+      centimeters: roundCurrency(centimeters),
+    };
+  });
+};
+
+const parseProductFabricUsageItems = (value) => {
+  const parsed = parseJSON(value);
+  return Array.isArray(parsed)
+    ? parsed
+        .map((item) => ({
+          color: String(item?.color || "").trim(),
+          centimeters: Number(item?.centimeters) || 0,
+        }))
+        .filter((item) => item.color && item.centimeters > 0)
+    : [];
+};
+
+const emptyFabricCuttingSummary = () => ({
+  items: [],
+  totals_by_color: [],
+  totalsByColor: [],
+});
+
+const parseFabricCuttingSummary = (value) => {
+  const parsed = parseJSON(value);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    return emptyFabricCuttingSummary();
+  }
+
+  const items = Array.isArray(parsed.items) ? parsed.items : [];
+  const totalsByColor = Array.isArray(parsed.totals_by_color)
+    ? parsed.totals_by_color
+    : Array.isArray(parsed.totalsByColor)
+      ? parsed.totalsByColor
+      : [];
+
+  return {
+    items,
+    totals_by_color: totalsByColor,
+    totalsByColor,
+  };
+};
+
 const IMPORTED_CATEGORY_NAME = "importados";
 
 const normalizeCategoryName = (category) =>
@@ -733,6 +816,9 @@ const normalizeProductResponse = (product) => {
           .filter((step) => step.step && Number.isFinite(step.cost))
       : [];
   const stockAvailable = getStockAvailable(product);
+  const fabricUsageItems = parseProductFabricUsageItems(
+    product.fabric_usage_items ?? product.fabricUsageItems,
+  );
 
   return {
     ...product,
@@ -757,6 +843,8 @@ const normalizeProductResponse = (product) => {
     costBreakdownEnabled,
     hasCostBreakdown: costBreakdownEnabled,
     costSteps: normalizedCostSteps,
+    fabric_usage_items: fabricUsageItems,
+    fabricUsageItems,
     imageUrl: normalizedImages[0] || product.imageUrl || null,
     images: normalizedImages,
     stock: Number(product.stock) || 0,
@@ -1034,6 +1122,67 @@ const sumServiceCostItems = (serviceCostItems) =>
     ),
   );
 
+const isFabricCuttingServiceType = (serviceType, typeConfig) =>
+  getOutsourcedServiceTypeKey(serviceType) === "fabric_cutting" ||
+  normalizeLabelKey(typeConfig?.label).includes("corte");
+
+const buildFabricCuttingSummary = async (expectedReturnItems = [], query = db) => {
+  const items = [];
+  const totalsMap = new Map();
+
+  for (const returnItem of Array.isArray(expectedReturnItems)
+    ? expectedReturnItems
+    : []) {
+    const productId = getItemProductId(returnItem);
+    const quantity = Number(returnItem?.quantity) || 0;
+    if (!productId || quantity <= 0) continue;
+
+    const product = await query("products").where({ id: productId }).first();
+    const fabricUsageItems = parseProductFabricUsageItems(
+      product?.fabric_usage_items,
+    );
+
+    for (const usage of fabricUsageItems) {
+      const centimetersPerPiece = Number(usage.centimeters) || 0;
+      if (centimetersPerPiece <= 0) continue;
+
+      const totalCentimeters = roundCurrency(quantity * centimetersPerPiece);
+      const totalMeters = roundCurrency(totalCentimeters / 100);
+      const row = {
+        productId,
+        productName: returnItem?.name || product?.name || productId,
+        color: usage.color,
+        pieces: quantity,
+        centimeters_per_piece: centimetersPerPiece,
+        centimetersPerUnit: centimetersPerPiece,
+        total_centimeters: totalCentimeters,
+        total_meters: totalMeters,
+      };
+      items.push(row);
+
+      const colorKey = normalizeLabelKey(usage.color);
+      const current = totalsMap.get(colorKey) || {
+        color: usage.color,
+        pieces: 0,
+        total_centimeters: 0,
+        total_meters: 0,
+      };
+      current.pieces += quantity;
+      current.total_centimeters = roundCurrency(
+        current.total_centimeters + totalCentimeters,
+      );
+      current.total_meters = roundCurrency(current.total_centimeters / 100);
+      totalsMap.set(colorKey, current);
+    }
+  }
+
+  return {
+    items,
+    totals_by_color: Array.from(totalsMap.values()),
+    totalsByColor: Array.from(totalsMap.values()),
+  };
+};
+
 const normalizeOutsourcedProductItems = async (
   items,
   { required = false, requireStockControlled = true } = {},
@@ -1152,6 +1301,9 @@ const normalizeOutsourcedService = (service, typeMap = null) => {
     input_items: parseOutsourcedItems(service.input_items),
     expected_return_items: parseOutsourcedItems(service.expected_return_items),
     service_cost_items: parseOutsourcedItems(service.service_cost_items),
+    fabric_cutting_summary: parseFabricCuttingSummary(
+      service.fabric_cutting_summary,
+    ),
     input_quantity: Number(service.input_quantity) || 0,
     fabric_paid_amount:
       service.fabric_paid_amount === null ||
@@ -1386,6 +1538,7 @@ async function initDatabase() {
       table.boolean("hidden").notNullable().defaultTo(false);
       table.boolean("costBreakdownEnabled").notNullable().defaultTo(false);
       table.text("costSteps");
+      table.text("fabric_usage_items");
       table.integer("quantidadeVenda").defaultTo(1);
       table.integer("minStock").defaultTo(0); // Estoque mínimo
     });
@@ -1484,6 +1637,16 @@ async function initDatabase() {
         table.text("costSteps");
       });
       console.log("Coluna costSteps adicionada a tabela products");
+    }
+    const hasFabricUsageItems = await db.schema.hasColumn(
+      "products",
+      "fabric_usage_items",
+    );
+    if (!hasFabricUsageItems) {
+      await db.schema.table("products", (table) => {
+        table.text("fabric_usage_items");
+      });
+      console.log("Coluna fabric_usage_items adicionada a tabela products");
     }
     const hasQuantidadeVenda = await db.schema.hasColumn(
       "products",
@@ -1989,6 +2152,7 @@ async function initDatabase() {
       table.decimal("fabric_paid_amount", 12, 2);
       table.decimal("service_cost_amount", 12, 2);
       table.text("service_cost_items");
+      table.text("fabric_cutting_summary");
       table.decimal("expected_return_quantity", 12, 3).notNullable();
       table.string("expected_return_unit").notNullable();
       table.text("expected_return_items");
@@ -2016,6 +2180,7 @@ async function initDatabase() {
       "input_items",
       "expected_return_items",
       "service_cost_items",
+      "fabric_cutting_summary",
     ];
     for (const colName of outsourcedServiceJsonColumns) {
       const hasCol = await db.schema.hasColumn("outsourced_services", colName);
@@ -3403,10 +3568,6 @@ app.post(
       const inputItems = await normalizeOutsourcedProductItems(
         req.body.input_items || req.body.inputItems,
       );
-      const inputQuantity =
-        inputItems.length > 0
-          ? sumOutsourcedItemsQuantity(inputItems)
-          : toPositiveNumber(req.body.input_quantity);
       const expectedReturnItems = await normalizeOutsourcedProductItems(
         req.body.expected_return_items || req.body.expectedReturnItems,
       );
@@ -3414,6 +3575,26 @@ app.post(
         expectedReturnItems.length > 0
           ? sumOutsourcedItemsQuantity(expectedReturnItems)
           : toPositiveNumber(req.body.expected_return_quantity);
+      const fabricCuttingService = isFabricCuttingServiceType(
+        serviceType,
+        typeConfig,
+      );
+      const fabricCuttingSummary = fabricCuttingService
+        ? await buildFabricCuttingSummary(expectedReturnItems)
+        : emptyFabricCuttingSummary();
+      const calculatedFabricMeters = roundCurrency(
+        fabricCuttingSummary.totals_by_color.reduce(
+          (sum, item) => sum + (Number(item.total_meters) || 0),
+          0,
+        ),
+      );
+      const inputQuantity =
+        inputItems.length > 0
+          ? sumOutsourcedItemsQuantity(inputItems)
+          : toPositiveNumber(req.body.input_quantity) ||
+            (fabricCuttingService && calculatedFabricMeters > 0
+              ? calculatedFabricMeters
+              : null);
       const dueDate = toIsoDate(req.body.due_date);
       const fabricPaidAmount = toNumberOrNull(req.body.fabric_paid_amount);
       const rawServiceCostAmount = toNumberOrNull(req.body.service_cost_amount);
@@ -3471,6 +3652,7 @@ app.post(
         fabric_paid_amount: fabricPaidAmount,
         service_cost_amount: serviceCostAmount,
         service_cost_items: toJsonText(serviceCostItems),
+        fabric_cutting_summary: toJsonText(fabricCuttingSummary),
         expected_return_quantity: expectedReturnQuantity,
         expected_return_unit: typeConfig.outputUnit,
         expected_return_items: toJsonText(expectedReturnItems),
@@ -3557,11 +3739,33 @@ app.put(
             )
           : parseOutsourcedItems(existing.expected_return_items);
 
+      const fabricCuttingService = isFabricCuttingServiceType(
+        serviceType,
+        typeConfig,
+      );
+      const fabricCuttingSummary = fabricCuttingService
+        ? await buildFabricCuttingSummary(expectedReturnItems)
+        : emptyFabricCuttingSummary();
+      const calculatedFabricMeters = roundCurrency(
+        fabricCuttingSummary.totals_by_color.reduce(
+          (sum, item) => sum + (Number(item.total_meters) || 0),
+          0,
+        ),
+      );
+      const shouldDeriveInputQuantity =
+        fabricCuttingService &&
+        calculatedFabricMeters > 0 &&
+        !hasField("input_quantity") &&
+        (hasField("expected_return_items") ||
+          hasField("expectedReturnItems") ||
+          hasField("service_type"));
       const inputQuantity =
         inputItems.length > 0
           ? sumOutsourcedItemsQuantity(inputItems)
           : hasField("input_quantity")
             ? toPositiveNumber(req.body.input_quantity)
+            : shouldDeriveInputQuantity
+              ? calculatedFabricMeters
             : Number(existing.input_quantity) || 0;
       const expectedReturnQuantity =
         expectedReturnItems.length > 0
@@ -3643,6 +3847,7 @@ app.put(
         fabric_paid_amount: fabricPaidAmount,
         service_cost_amount: serviceCostAmount,
         service_cost_items: toJsonText(serviceCostItems),
+        fabric_cutting_summary: toJsonText(fabricCuttingSummary),
         expected_return_quantity: expectedReturnQuantity,
         expected_return_unit: typeConfig.outputUnit,
         expected_return_items: toJsonText(expectedReturnItems),
@@ -4631,6 +4836,9 @@ app.post(
       const costSteps = productCostBreakdownEnabled
         ? normalizeProductCostSteps(costStepsPayload, true)
         : [];
+      const fabricUsageItems = normalizeProductFabricUsageItems(
+        getProductFabricUsagePayload(req.body),
+      );
       const calculatedPriceRaw = productCostBreakdownEnabled
         ? sumProductCostSteps(costSteps)
         : priceRaw !== undefined
@@ -4652,6 +4860,7 @@ app.post(
         hidden: productHidden,
         costBreakdownEnabled: productCostBreakdownEnabled,
         costSteps: JSON.stringify(costSteps),
+        fabric_usage_items: JSON.stringify(fabricUsageItems),
         stock: stock !== undefined && stock !== null ? toStockNumber(stock) : 0,
         minStock: minStock !== undefined ? parseInt(minStock) : 0,
         quantidadeVenda:
@@ -4769,6 +4978,13 @@ app.put(
           updates.costSteps = JSON.stringify([]);
           if (priceRaw !== undefined) updates.priceRaw = parseFloat(priceRaw);
         }
+      }
+
+      const fabricUsagePayload = getProductFabricUsagePayload(req.body);
+      if (fabricUsagePayload !== undefined) {
+        updates.fabric_usage_items = JSON.stringify(
+          normalizeProductFabricUsageItems(fabricUsagePayload),
+        );
       }
 
       const hasHiddenPayload =
