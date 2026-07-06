@@ -185,13 +185,27 @@ export function generateStyledOrderPdf(order) {
   // Tabela de produtos
   doc.font("Helvetica-Bold").fontSize(14).text("PRODUTOS", 40, y);
   y += 24;
+  const pageRight = doc.page.width - doc.page.margins.right;
+  const tableX = doc.page.margins.left;
+  const qtyWidth = 44;
+  const unitWidth = 78;
+  const subtotalWidth = 82;
+  const gap = 10;
+  const subtotalX = pageRight - subtotalWidth;
+  const unitX = subtotalX - gap - unitWidth;
+  const qtyX = unitX - gap - qtyWidth;
+  const productWidth = qtyX - gap - tableX;
+
   doc
     .fontSize(11)
     .font("Helvetica-Bold")
-    .text("Produto", 40, y)
-    .text("Qtd", 200, y)
-    .text("Valor Unit.", 250, y)
-    .text("Subtotal", 350, y);
+    .text("Produto", tableX, y, { width: productWidth })
+    .text("Qtd", qtyX, y, { width: qtyWidth, align: "right" })
+    .text("Valor Unit.", unitX, y, { width: unitWidth, align: "right" })
+    .text("Subtotal", subtotalX, y, {
+      width: subtotalWidth,
+      align: "right",
+    });
   y += 18;
   // Exibe produtos comprados
   (order.items || []).forEach((item) => {
@@ -210,14 +224,29 @@ export function generateStyledOrderPdf(order) {
         : item.valor_unit || item.unit_price || 0;
     const numericQtd = toNumber(qtd) || 1;
     const numericValor = toNumber(valor);
+    const rowTop = y;
+    const productOptions = {
+      width: productWidth,
+      height: 28,
+      ellipsis: true,
+    };
+    doc.font("Helvetica").fontSize(11);
     doc
-      .font("Helvetica")
-      .fontSize(11)
-      .text(nome, 40, y)
-      .text(qtd, 200, y)
-      .text(`R$ ${numericValor.toFixed(2)}`, 250, y)
-      .text(`R$ ${(numericValor * numericQtd).toFixed(2)}`, 350, y);
-    y += 16;
+      .text(nome, tableX, rowTop, productOptions)
+      .text(String(qtd), qtyX, rowTop, {
+        width: qtyWidth,
+        align: "right",
+      })
+      .text(`R$ ${numericValor.toFixed(2)}`, unitX, rowTop, {
+        width: unitWidth,
+        align: "right",
+      })
+      .text(`R$ ${(numericValor * numericQtd).toFixed(2)}`, subtotalX, rowTop, {
+        width: subtotalWidth,
+        align: "right",
+      });
+    const nameHeight = doc.heightOfString(nome, productOptions);
+    y += Math.max(16, Math.min(28, nameHeight)) + 4;
   });
 
   // Total
@@ -225,11 +254,12 @@ export function generateStyledOrderPdf(order) {
   doc
     .font("Helvetica-Bold")
     .fontSize(13)
-    .text("TOTAL:", 250, y)
+    .text("TOTAL:", unitX, y, { width: unitWidth, align: "right" })
     .text(
       `R$ ${toNumber(order.total !== undefined ? order.total : order.valor_total || 0).toFixed(2)}`,
-      350,
+      subtotalX,
       y,
+      { width: subtotalWidth, align: "right" },
     );
   y += 32;
 

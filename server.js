@@ -147,6 +147,40 @@ const dbConfig = process.env.DATABASE_URL
 
 const db = knex(dbConfig);
 
+const ADMIN_ORDER_EVENT_HISTORY_LIMIT = 200;
+const adminOrderEventClients = new Set();
+const adminOrderEventHistory = [];
+
+const pushAdminOrderEvent = (event) => {
+  adminOrderEventHistory.push(event);
+  if (adminOrderEventHistory.length > ADMIN_ORDER_EVENT_HISTORY_LIMIT) {
+    adminOrderEventHistory.splice(
+      0,
+      adminOrderEventHistory.length - ADMIN_ORDER_EVENT_HISTORY_LIMIT,
+    );
+  }
+
+  const payload = `id: ${event.eventId}\nevent: order_created\ndata: ${JSON.stringify(event.data)}\n\n`;
+  for (const client of adminOrderEventClients) {
+    client.write(payload);
+  }
+};
+
+const emitOrderCreatedForAdmins = (order) => {
+  const timestamp = order.timestamp || new Date().toISOString();
+  pushAdminOrderEvent({
+    eventId: `${timestamp}:${order.id}`,
+    type: "order_created",
+    timestamp,
+    data: {
+      id: order.id,
+      userName: order.userName || "Cliente",
+      total: Number(order.total) || 0,
+      timestamp,
+    },
+  });
+};
+
 const parseJSON = (data) => {
   if (typeof data === "string") {
     try {
@@ -923,6 +957,83 @@ const parseOutsourcedItems = (value) => {
   return Array.isArray(parsed) ? parsed : [];
 };
 
+const normalizeLabelKey = (value) =>
+  String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase();
+
+const isSewingServiceType = (serviceType, typeConfig) =>
+  getOutsourcedServiceTypeKey(serviceType) === "sewing" ||
+  normalizeLabelKey(typeConfig?.label) === "costura";
+
+const normalizeServiceCostItems = (items, expectedReturnItems = []) => {
+  if (items === undefined || items === null || items === "") {
+    return [];
+  }
+
+  const parsed = typeof items === "string" ? parseJSON(items) : items;
+  if (!Array.isArray(parsed)) {
+    throw validationError("service_cost_items deve ser uma lista.");
+  }
+
+  return parsed.map((item, index) => {
+    const productId = getItemProductId(item);
+    const amount = Number(item?.amount);
+
+    if (!productId) {
+      throw validationError(
+        `Informe o productId do custo de servico ${index + 1}.`,
+      );
+    }
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw validationError(
+        `Informe amount maior ou igual a zero para o custo de servico ${index + 1}.`,
+      );
+    }
+
+    const expectedItem = expectedReturnItems.find(
+      (expected) => String(expected.productId) === String(productId),
+    );
+
+    return {
+      productId,
+      id: productId,
+      name: item?.name || expectedItem?.name || productId,
+      amount: roundCurrency(amount),
+    };
+  });
+};
+
+const validateSewingServiceCostItems = (serviceCostItems, expectedReturnItems) => {
+  const expectedIds = new Set(
+    (Array.isArray(expectedReturnItems) ? expectedReturnItems : []).map((item) =>
+      String(item.productId),
+    ),
+  );
+  const costIds = new Set(
+    (Array.isArray(serviceCostItems) ? serviceCostItems : []).map((item) =>
+      String(item.productId),
+    ),
+  );
+
+  const missingIds = [...expectedIds].filter((productId) => !costIds.has(productId));
+  if (missingIds.length > 0) {
+    throw validationError(
+      `Informe service_cost_items para todos os produtos de retorno: ${missingIds.join(", ")}.`,
+    );
+  }
+};
+
+const sumServiceCostItems = (serviceCostItems) =>
+  roundCurrency(
+    (Array.isArray(serviceCostItems) ? serviceCostItems : []).reduce(
+      (sum, item) => sum + (Number(item.amount) || 0),
+      0,
+    ),
+  );
+
 const normalizeOutsourcedProductItems = async (
   items,
   { required = false, requireStockControlled = true } = {},
@@ -1040,6 +1151,7 @@ const normalizeOutsourcedService = (service, typeMap = null) => {
     output_mode: typeConfig.outputMode || null,
     input_items: parseOutsourcedItems(service.input_items),
     expected_return_items: parseOutsourcedItems(service.expected_return_items),
+    service_cost_items: parseOutsourcedItems(service.service_cost_items),
     input_quantity: Number(service.input_quantity) || 0,
     fabric_paid_amount:
       service.fabric_paid_amount === null ||
@@ -1066,6 +1178,7 @@ const normalizeOutsourcedServiceForRequest = (service, req, typeMap = null) => {
   const {
     fabric_paid_amount,
     service_cost_amount,
+    service_cost_items,
     ...employeeVisibleService
   } = normalized;
   return employeeVisibleService;
@@ -1875,6 +1988,7 @@ async function initDatabase() {
       table.text("input_items");
       table.decimal("fabric_paid_amount", 12, 2);
       table.decimal("service_cost_amount", 12, 2);
+      table.text("service_cost_items");
       table.decimal("expected_return_quantity", 12, 3).notNullable();
       table.string("expected_return_unit").notNullable();
       table.text("expected_return_items");
@@ -1901,6 +2015,7 @@ async function initDatabase() {
     const outsourcedServiceJsonColumns = [
       "input_items",
       "expected_return_items",
+      "service_cost_items",
     ];
     for (const colName of outsourcedServiceJsonColumns) {
       const hasCol = await db.schema.hasColumn("outsourced_services", colName);
@@ -2395,6 +2510,82 @@ const authorizeKitchen = (req, res, next) => {
   }
   next();
 };
+
+const authenticateAdminOrderEvents = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const bearerToken = authHeader && authHeader.split(" ")[1];
+  const token = bearerToken || req.query.token;
+
+  if (!token) {
+    return res
+      .status(401)
+      .json({ error: "Acesso negado. Token nao fornecido." });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: "Token invalido ou expirado." });
+    }
+    if (user.role !== "admin" && user.role !== "superadmin") {
+      return res
+        .status(403)
+        .json({ error: "Acesso negado. Requer permissao de administrador." });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+app.get(
+  "/api/admin/orders/events/history",
+  authenticateAdminOrderEvents,
+  (req, res) => {
+    const sinceTimestamp =
+      typeof req.query.sinceTimestamp === "string"
+        ? req.query.sinceTimestamp
+        : "";
+    const sinceId = typeof req.query.sinceId === "string" ? req.query.sinceId : "";
+    const limit = Math.min(
+      100,
+      Math.max(1, parseInt(req.query.limit || "50", 10) || 50),
+    );
+
+    const events = adminOrderEventHistory
+      .filter((event) => {
+        if (sinceTimestamp && event.timestamp <= sinceTimestamp) return false;
+        if (sinceId && event.data.id <= sinceId) return false;
+        return true;
+      })
+      .slice(-limit);
+
+    res.json({ events });
+  },
+);
+
+app.get(
+  "/api/admin/orders/events",
+  authenticateAdminOrderEvents,
+  (req, res) => {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.write(": connected\n\n");
+
+    adminOrderEventClients.add(res);
+
+    const heartbeat = setInterval(() => {
+      res.write(": keep-alive\n\n");
+    }, 25000);
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      adminOrderEventClients.delete(res);
+    });
+  },
+);
 
 app.get(
   "/api/super-admin/employees",
@@ -3225,7 +3416,16 @@ app.post(
           : toPositiveNumber(req.body.expected_return_quantity);
       const dueDate = toIsoDate(req.body.due_date);
       const fabricPaidAmount = toNumberOrNull(req.body.fabric_paid_amount);
-      const serviceCostAmount = toNumberOrNull(req.body.service_cost_amount);
+      const rawServiceCostAmount = toNumberOrNull(req.body.service_cost_amount);
+      const serviceCostItems = normalizeServiceCostItems(
+        req.body.service_cost_items || req.body.serviceCostItems,
+        expectedReturnItems,
+      );
+      const serviceCostItemsTotal = sumServiceCostItems(serviceCostItems);
+      const sewingService = isSewingServiceType(serviceType, typeConfig);
+      const serviceCostAmount = sewingService
+        ? serviceCostItemsTotal
+        : rawServiceCostAmount ?? (serviceCostItems.length ? serviceCostItemsTotal : null);
 
       if (!inputQuantity) {
         return res
@@ -3250,6 +3450,9 @@ app.post(
           .status(400)
           .json({ error: "Valor pago pelo tecido nao pode ser negativo" });
       }
+      if (sewingService) {
+        validateSewingServiceCostItems(serviceCostItems, expectedReturnItems);
+      }
       if (serviceCostAmount !== null && serviceCostAmount < 0) {
         return res
           .status(400)
@@ -3267,6 +3470,7 @@ app.post(
         input_items: toJsonText(inputItems),
         fabric_paid_amount: fabricPaidAmount,
         service_cost_amount: serviceCostAmount,
+        service_cost_items: toJsonText(serviceCostItems),
         expected_return_quantity: expectedReturnQuantity,
         expected_return_unit: typeConfig.outputUnit,
         expected_return_items: toJsonText(expectedReturnItems),
@@ -3296,6 +3500,174 @@ app.post(
       res
         .status(e.statusCode || 500)
         .json({ error: e.statusCode ? e.message : "Erro ao criar servico terceirizado" });
+    }
+  },
+);
+
+app.put(
+  "/api/admin/outsourced-services/:id",
+  authenticateToken,
+  authorizeOutsourcedAccess,
+  async (req, res) => {
+    try {
+      const existing = await db("outsourced_services")
+        .where({ id: req.params.id })
+        .first();
+      if (!existing) {
+        return res.status(404).json({ error: "Servico nao encontrado" });
+      }
+
+      const hasField = (field) =>
+        Object.prototype.hasOwnProperty.call(req.body, field);
+
+      const companyId =
+        req.body.company_id !== undefined || req.body.companyId !== undefined
+          ? req.body.company_id || req.body.companyId
+          : existing.company_id;
+      if (companyId !== existing.company_id) {
+        const company = await db("outsourced_companies")
+          .where({ id: companyId, active: true })
+          .first();
+        if (!company) {
+          return res
+            .status(400)
+            .json({ error: "Empresa terceirizada ativa e obrigatoria" });
+        }
+      }
+
+      const serviceType =
+        req.body.service_type !== undefined
+          ? getOutsourcedServiceTypeKey(req.body.service_type)
+          : existing.service_type;
+      const typeConfig = await getOutsourcedServiceTypeConfig(serviceType);
+      if (!typeConfig) {
+        return res.status(400).json({ error: "Tipo de servico invalido" });
+      }
+
+      const inputItems =
+        hasField("input_items") || hasField("inputItems")
+          ? await normalizeOutsourcedProductItems(
+              req.body.input_items || req.body.inputItems,
+            )
+          : parseOutsourcedItems(existing.input_items);
+      const expectedReturnItems =
+        hasField("expected_return_items") || hasField("expectedReturnItems")
+          ? await normalizeOutsourcedProductItems(
+              req.body.expected_return_items || req.body.expectedReturnItems,
+            )
+          : parseOutsourcedItems(existing.expected_return_items);
+
+      const inputQuantity =
+        inputItems.length > 0
+          ? sumOutsourcedItemsQuantity(inputItems)
+          : hasField("input_quantity")
+            ? toPositiveNumber(req.body.input_quantity)
+            : Number(existing.input_quantity) || 0;
+      const expectedReturnQuantity =
+        expectedReturnItems.length > 0
+          ? sumOutsourcedItemsQuantity(expectedReturnItems)
+          : hasField("expected_return_quantity")
+            ? toPositiveNumber(req.body.expected_return_quantity)
+            : Number(existing.expected_return_quantity) || 0;
+      const dueDate = hasField("due_date")
+        ? toIsoDate(req.body.due_date)
+        : existing.due_date;
+      const fabricPaidAmount = hasField("fabric_paid_amount")
+        ? toNumberOrNull(req.body.fabric_paid_amount)
+        : existing.fabric_paid_amount === null ||
+            existing.fabric_paid_amount === undefined
+          ? null
+          : Number(existing.fabric_paid_amount);
+
+      const serviceCostItemsProvided =
+        hasField("service_cost_items") || hasField("serviceCostItems");
+      const serviceCostItems = serviceCostItemsProvided
+        ? normalizeServiceCostItems(
+            req.body.service_cost_items || req.body.serviceCostItems,
+            expectedReturnItems,
+          )
+        : parseOutsourcedItems(existing.service_cost_items);
+      const serviceCostItemsTotal = sumServiceCostItems(serviceCostItems);
+      const rawServiceCostAmount = hasField("service_cost_amount")
+        ? toNumberOrNull(req.body.service_cost_amount)
+        : existing.service_cost_amount === null ||
+            existing.service_cost_amount === undefined
+          ? null
+          : Number(existing.service_cost_amount);
+      const sewingService = isSewingServiceType(serviceType, typeConfig);
+      const serviceCostAmount = sewingService
+        ? serviceCostItemsTotal
+        : rawServiceCostAmount ??
+          (serviceCostItemsProvided && serviceCostItems.length
+            ? serviceCostItemsTotal
+            : null);
+
+      if (!inputQuantity) {
+        return res
+          .status(400)
+          .json({ error: "Quantidade retirada deve ser maior que zero" });
+      }
+      if (!expectedReturnQuantity) {
+        return res
+          .status(400)
+          .json({ error: "Quantidade prevista de retorno e obrigatoria" });
+      }
+      if (typeConfig.outputMode === "products" && expectedReturnItems.length === 0) {
+        return res.status(400).json({
+          error: "Informe os produtos e quantidades previstos para retorno.",
+        });
+      }
+      if (!dueDate) {
+        return res.status(400).json({ error: "Prazo de entrega invalido" });
+      }
+      if (fabricPaidAmount !== null && fabricPaidAmount < 0) {
+        return res
+          .status(400)
+          .json({ error: "Valor pago pelo tecido nao pode ser negativo" });
+      }
+      if (sewingService) {
+        validateSewingServiceCostItems(serviceCostItems, expectedReturnItems);
+      }
+      if (serviceCostAmount !== null && serviceCostAmount < 0) {
+        return res
+          .status(400)
+          .json({ error: "Valor cobrado pelo servico nao pode ser negativo" });
+      }
+
+      const updates = {
+        company_id: companyId,
+        service_type: serviceType,
+        input_quantity: inputQuantity,
+        input_unit: typeConfig.inputUnit,
+        input_items: toJsonText(inputItems),
+        fabric_paid_amount: fabricPaidAmount,
+        service_cost_amount: serviceCostAmount,
+        service_cost_items: toJsonText(serviceCostItems),
+        expected_return_quantity: expectedReturnQuantity,
+        expected_return_unit: typeConfig.outputUnit,
+        expected_return_items: toJsonText(expectedReturnItems),
+        due_date: dueDate,
+        updated_at: new Date().toISOString(),
+      };
+
+      if (hasField("started_at")) {
+        updates.started_at = toIsoDate(req.body.started_at) || existing.started_at;
+      }
+      if (hasField("notes")) updates.notes = req.body.notes || null;
+
+      await db("outsourced_services").where({ id: req.params.id }).update(updates);
+      const updated = await db("outsourced_services as s")
+        .leftJoin("outsourced_companies as c", "s.company_id", "c.id")
+        .select("s.*", "c.name as company_name")
+        .where("s.id", req.params.id)
+        .first();
+      const typeMap = await getOutsourcedServiceTypeMap();
+      res.json(normalizeOutsourcedServiceForRequest(updated, req, typeMap));
+    } catch (e) {
+      console.error("Erro ao atualizar servico terceirizado:", e);
+      res.status(e.statusCode || 500).json({
+        error: e.statusCode ? e.message : "Erro ao atualizar servico terceirizado",
+      });
     }
   },
 );
@@ -5338,6 +5710,8 @@ app.post("/api/orders", async (req, res) => {
     }
 
     // Iniciamos uma transação para garantir integridade dos dados
+    let createdOrderResponse = null;
+
     await db.transaction(async (trx) => {
       // 1. Garante que o usuário existe
       const userExists = await trx("users").where({ id: effectiveUserId }).first();
@@ -5523,8 +5897,11 @@ app.post("/api/orders", async (req, res) => {
       }
 
       console.log(`✅ Pedido ${newOrder.id} criado com sucesso!`);
-      res.status(201).json({ ...newOrder, items: itemsWithPrecoBruto });
+      createdOrderResponse = { ...newOrder, items: itemsWithPrecoBruto };
     });
+
+    emitOrderCreatedForAdmins(createdOrderResponse);
+    res.status(201).json(createdOrderResponse);
   } catch (e) {
     console.error("❌ Erro ao salvar pedido:", e);
     res
