@@ -3452,6 +3452,16 @@ app.get(
   async (req, res) => {
     try {
       const { status, companyId, overdue } = req.query;
+      const companyName = String(
+        req.query.companyName || req.query.company_name || "",
+      ).trim();
+      const productId = String(
+        req.query.productId || req.query.product_id || "",
+      ).trim();
+      const productName = String(
+        req.query.productName || req.query.product_name || req.query.product || "",
+      ).trim();
+
       const query = db("outsourced_services as s")
         .leftJoin("outsourced_companies as c", "s.company_id", "c.id")
         .select("s.*", "c.name as company_name")
@@ -3464,14 +3474,35 @@ app.get(
           .where("s.status", "pendente")
           .where("s.due_date", "<", new Date().toISOString());
       }
+      if (companyName) {
+        query.whereRaw("LOWER(c.name) LIKE ?", [
+          `%${companyName.toLowerCase().replace(/[%_]/g, "\\$&")}%`,
+        ]);
+      }
 
       const services = await query;
       const typeMap = await getOutsourcedServiceTypeMap();
-      res.json(
-        services.map((service) =>
-          normalizeOutsourcedServiceForRequest(service, req, typeMap),
-        ),
+      let normalized = services.map((service) =>
+        normalizeOutsourcedServiceForRequest(service, req, typeMap),
       );
+
+      if (productId) {
+        normalized = normalized.filter((service) =>
+          (service.expected_return_items || []).some(
+            (item) => item.productId === productId || item.id === productId,
+          ),
+        );
+      }
+      if (productName) {
+        const term = productName.toLowerCase();
+        normalized = normalized.filter((service) =>
+          (service.expected_return_items || []).some((item) =>
+            String(item.name || "").toLowerCase().includes(term),
+          ),
+        );
+      }
+
+      res.json(normalized);
     } catch (e) {
       console.error("Erro ao buscar servicos terceirizados:", e);
       res.status(500).json({ error: "Erro ao buscar servicos terceirizados" });
