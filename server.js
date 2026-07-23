@@ -1320,6 +1320,8 @@ const normalizeOutsourcedService = (service, typeMap = null) => {
     remaining_quantity: Math.max(0, expectedReturn - totalDelivered),
     status,
     is_overdue: !!isOverdue,
+    paid: isTruthyDb(service.paid),
+    paid_at: service.paid_at || null,
   };
 };
 
@@ -1331,6 +1333,8 @@ const normalizeOutsourcedServiceForRequest = (service, req, typeMap = null) => {
     fabric_paid_amount,
     service_cost_amount,
     service_cost_items,
+    paid,
+    paid_at,
     ...employeeVisibleService
   } = normalized;
   return employeeVisibleService;
@@ -2153,6 +2157,8 @@ async function initDatabase() {
       table.decimal("service_cost_amount", 12, 2);
       table.text("service_cost_items");
       table.text("fabric_cutting_summary");
+      table.boolean("paid").notNullable().defaultTo(false);
+      table.timestamp("paid_at");
       table.decimal("expected_return_quantity", 12, 3).notNullable();
       table.string("expected_return_unit").notNullable();
       table.text("expected_return_items");
@@ -2190,6 +2196,17 @@ async function initDatabase() {
         });
         console.log(`Coluna ${colName} adicionada a outsourced_services`);
       }
+    }
+    const hasPaidColumn = await db.schema.hasColumn(
+      "outsourced_services",
+      "paid",
+    );
+    if (!hasPaidColumn) {
+      await db.schema.table("outsourced_services", (table) => {
+        table.boolean("paid").notNullable().defaultTo(false);
+        table.timestamp("paid_at");
+      });
+      console.log("Colunas paid/paid_at adicionadas a outsourced_services");
     }
   }
 
@@ -3445,6 +3462,76 @@ app.put(
   },
 );
 
+// Marca em lote todos os servicos em aberto (nao pagos) de uma empresa
+// terceirizada como pagos, opcionalmente restrito a um periodo de prazo.
+app.put(
+  "/api/admin/outsourced-companies/:companyId/mark-services-paid",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { companyId } = req.params;
+      const company = await db("outsourced_companies")
+        .where({ id: companyId })
+        .first();
+      if (!company) {
+        return res
+          .status(404)
+          .json({ error: "Empresa terceirizada nao encontrada" });
+      }
+
+      const dueFromRaw = String(
+        req.body.dueFrom || req.body.due_from || "",
+      ).trim();
+      const dueToRaw = String(req.body.dueTo || req.body.due_to || "").trim();
+
+      const query = db("outsourced_services")
+        .where({ company_id: companyId })
+        .whereNotNull("service_cost_amount")
+        .where((builder) => builder.where("paid", false).orWhereNull("paid"));
+
+      if (dueFromRaw) {
+        const dueFrom = new Date(`${dueFromRaw}T00:00:00`);
+        if (!Number.isNaN(dueFrom.getTime())) {
+          query.where("due_date", ">=", dueFrom.toISOString());
+        }
+      }
+      if (dueToRaw) {
+        const dueTo = new Date(`${dueToRaw}T23:59:59.999`);
+        if (!Number.isNaN(dueTo.getTime())) {
+          query.where("due_date", "<=", dueTo.toISOString());
+        }
+      }
+
+      const pendingServices = await query.select("id", "service_cost_amount");
+      const totalPaid = pendingServices.reduce(
+        (sum, service) => sum + (Number(service.service_cost_amount) || 0),
+        0,
+      );
+
+      if (pendingServices.length > 0) {
+        const now = new Date().toISOString();
+        await db("outsourced_services")
+          .whereIn(
+            "id",
+            pendingServices.map((service) => service.id),
+          )
+          .update({ paid: true, paid_at: now, updated_at: now });
+      }
+
+      res.json({
+        markedCount: pendingServices.length,
+        totalPaid: Number(totalPaid.toFixed(2)),
+      });
+    } catch (e) {
+      console.error("Erro ao marcar servicos terceirizados como pagos:", e);
+      res.status(500).json({
+        error: "Erro ao marcar servicos terceirizados como pagos",
+      });
+    }
+  },
+);
+
 app.get(
   "/api/admin/outsourced-services",
   authenticateToken,
@@ -3461,6 +3548,10 @@ app.get(
       const productName = String(
         req.query.productName || req.query.product_name || req.query.product || "",
       ).trim();
+      const dueFromRaw = String(
+        req.query.dueFrom || req.query.due_from || "",
+      ).trim();
+      const dueToRaw = String(req.query.dueTo || req.query.due_to || "").trim();
 
       const query = db("outsourced_services as s")
         .leftJoin("outsourced_companies as c", "s.company_id", "c.id")
@@ -3478,6 +3569,18 @@ app.get(
         query.whereRaw("LOWER(c.name) LIKE ?", [
           `%${companyName.toLowerCase().replace(/[%_]/g, "\\$&")}%`,
         ]);
+      }
+      if (dueFromRaw) {
+        const dueFrom = new Date(`${dueFromRaw}T00:00:00`);
+        if (!Number.isNaN(dueFrom.getTime())) {
+          query.where("s.due_date", ">=", dueFrom.toISOString());
+        }
+      }
+      if (dueToRaw) {
+        const dueTo = new Date(`${dueToRaw}T23:59:59.999`);
+        if (!Number.isNaN(dueTo.getTime())) {
+          query.where("s.due_date", "<=", dueTo.toISOString());
+        }
       }
 
       const services = await query;
