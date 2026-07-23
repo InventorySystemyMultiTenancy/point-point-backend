@@ -5990,6 +5990,16 @@ app.post("/api/orders", async (req, res) => {
         );
       }
 
+      const isChequePayment =
+        String(paymentType || "").toLowerCase() === "presencial" &&
+        String(paymentMethod || "").trim().toLowerCase() === "cheque";
+
+      if (isChequePayment && !currentUserHasMonthlyPayment) {
+        throw validationError(
+          "Pagamento com cheque permitido apenas para clientes com pagamento mensal ativo.",
+        );
+      }
+
       let selectedCarrierId = null;
       if (carrierId && deliveryMeta.value === "carrier") {
         const carrier = await trx("shipping_carriers")
