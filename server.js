@@ -199,13 +199,51 @@ const parseSeparationChecklist = (data) => {
     : [];
 };
 
-const normalizeOrderResponse = (order) => ({
-  ...order,
-  items: parseJSON(order.items),
-  total: parseFloat(order.total),
-  separationChecklist: parseSeparationChecklist(order.separationChecklist),
-  entregueCliente: isTruthyDb(order.entregueCliente),
-});
+const getOrderDeliveredQtyMap = (deliveredItems) => {
+  const map = new Map();
+  for (const entry of deliveredItems || []) {
+    if (!entry || !entry.productId) continue;
+    map.set(
+      entry.productId,
+      (map.get(entry.productId) || 0) + (Number(entry.quantity) || 0),
+    );
+  }
+  return map;
+};
+
+const computeOrderRemainingItems = (items, deliveredItems) => {
+  const deliveredMap = getOrderDeliveredQtyMap(deliveredItems);
+  return (items || []).map((item) => {
+    const ordered = Number(item.quantity) || 0;
+    const delivered = Math.min(deliveredMap.get(item.productId) || 0, ordered);
+    return {
+      productId: item.productId,
+      quantity: Math.max(0, ordered - delivered),
+    };
+  });
+};
+
+const isOrderFullyDelivered = (items, deliveredItems) => {
+  const orderItems = items || [];
+  if (orderItems.length === 0) return false;
+  return computeOrderRemainingItems(orderItems, deliveredItems).every(
+    (item) => item.quantity <= 0,
+  );
+};
+
+const normalizeOrderResponse = (order) => {
+  const items = parseJSON(order.items);
+  const deliveredItems = parseJSON(order.deliveredItems);
+  return {
+    ...order,
+    items,
+    total: parseFloat(order.total),
+    separationChecklist: parseSeparationChecklist(order.separationChecklist),
+    entregueCliente: isTruthyDb(order.entregueCliente),
+    deliveredItems,
+    remainingItems: computeOrderRemainingItems(items, deliveredItems),
+  };
+};
 
 const BACKORDER_NOTICE =
   "Produto sob encomenda: prazo minimo de espera de 7 dias uteis.";
@@ -1322,6 +1360,18 @@ const normalizeOutsourcedService = (service, typeMap = null) => {
     is_overdue: !!isOverdue,
     paid: isTruthyDb(service.paid),
     paid_at: service.paid_at || null,
+    paid_amount: Number(service.paid_amount) || 0,
+    remaining_amount:
+      service.service_cost_amount === null ||
+      service.service_cost_amount === undefined
+        ? null
+        : Math.max(
+            0,
+            roundCurrency(
+              Number(service.service_cost_amount) -
+                (Number(service.paid_amount) || 0),
+            ),
+          ),
   };
 };
 
@@ -1335,6 +1385,8 @@ const normalizeOutsourcedServiceForRequest = (service, req, typeMap = null) => {
     service_cost_items,
     paid,
     paid_at,
+    paid_amount,
+    remaining_amount,
     ...employeeVisibleService
   } = normalized;
   return employeeVisibleService;
@@ -1353,6 +1405,9 @@ const cleanupExpiredOutsourcedServices = async () => {
 
   const expiredIds = expiredServices.map((service) => service.id);
   await db("outsourced_service_deliveries")
+    .whereIn("service_id", expiredIds)
+    .del();
+  await db("outsourced_service_payments")
     .whereIn("service_id", expiredIds)
     .del();
   await db("outsourced_services").whereIn("id", expiredIds).del();
@@ -1839,6 +1894,7 @@ async function initDatabase() {
       table.boolean("entregueCliente").defaultTo(false);
       table.text("separationChecklist");
       table.timestamp("separationChecklistUpdatedAt");
+      table.text("deliveredItems");
       table.timestamp("created_at").defaultTo(db.fn.now());
     });
   }
@@ -1853,6 +1909,36 @@ async function initDatabase() {
       table.text("observation"); // Usando text para permitir observações mais longas
     });
     console.log("✅ Coluna 'observation' adicionada à tabela orders");
+  }
+
+  // Adiciona a coluna 'deliveredItems' (rastreio de entrega parcial por item)
+  const hasDeliveredItemsColumn = await db.schema.hasColumn(
+    "orders",
+    "deliveredItems",
+  );
+  if (!hasDeliveredItemsColumn) {
+    await db.schema.table("orders", (table) => {
+      table.text("deliveredItems");
+    });
+    console.log("✅ Coluna 'deliveredItems' adicionada à tabela orders");
+  }
+
+  if (!(await db.schema.hasTable("order_deliveries"))) {
+    await db.schema.createTable("order_deliveries", (table) => {
+      table.string("id").primary();
+      table
+        .string("order_id")
+        .notNullable()
+        .references("id")
+        .inTable("orders")
+        .onDelete("CASCADE");
+      table.text("items").notNullable();
+      table.decimal("quantity", 12, 3).notNullable();
+      table.timestamp("delivered_at").notNullable();
+      table.text("observation");
+      table.timestamp("created_at").defaultTo(db.fn.now());
+    });
+    console.log("✅ Tabela 'order_deliveries' criada com sucesso");
   }
 
   const hasHiddenFromHistoryColumn = await db.schema.hasColumn(
@@ -2159,6 +2245,7 @@ async function initDatabase() {
       table.text("fabric_cutting_summary");
       table.boolean("paid").notNullable().defaultTo(false);
       table.timestamp("paid_at");
+      table.decimal("paid_amount", 12, 2).notNullable().defaultTo(0);
       table.decimal("expected_return_quantity", 12, 3).notNullable();
       table.string("expected_return_unit").notNullable();
       table.text("expected_return_items");
@@ -2208,6 +2295,16 @@ async function initDatabase() {
       });
       console.log("Colunas paid/paid_at adicionadas a outsourced_services");
     }
+    const hasPaidAmountColumn = await db.schema.hasColumn(
+      "outsourced_services",
+      "paid_amount",
+    );
+    if (!hasPaidAmountColumn) {
+      await db.schema.table("outsourced_services", (table) => {
+        table.decimal("paid_amount", 12, 2).notNullable().defaultTo(0);
+      });
+      console.log("Coluna paid_amount adicionada a outsourced_services");
+    }
   }
 
   if (!(await db.schema.hasTable("outsourced_service_deliveries"))) {
@@ -2249,6 +2346,23 @@ async function initDatabase() {
         );
       }
     }
+  }
+
+  if (!(await db.schema.hasTable("outsourced_service_payments"))) {
+    await db.schema.createTable("outsourced_service_payments", (table) => {
+      table.string("id").primary();
+      table
+        .string("service_id")
+        .notNullable()
+        .references("id")
+        .inTable("outsourced_services")
+        .onDelete("CASCADE");
+      table.decimal("amount", 12, 2).notNullable();
+      table.timestamp("paid_at").notNullable();
+      table.text("observation");
+      table.timestamp("created_at").defaultTo(db.fn.now());
+    });
+    console.log("Tabela 'outsourced_service_payments' criada com sucesso");
   }
 
   try {
@@ -3503,20 +3617,36 @@ app.put(
         }
       }
 
-      const pendingServices = await query.select("id", "service_cost_amount");
+      const pendingServices = await query.select(
+        "id",
+        "service_cost_amount",
+        "paid_amount",
+      );
       const totalPaid = pendingServices.reduce(
-        (sum, service) => sum + (Number(service.service_cost_amount) || 0),
+        (sum, service) =>
+          sum +
+          Math.max(
+            0,
+            (Number(service.service_cost_amount) || 0) -
+              (Number(service.paid_amount) || 0),
+          ),
         0,
       );
 
       if (pendingServices.length > 0) {
         const now = new Date().toISOString();
-        await db("outsourced_services")
-          .whereIn(
-            "id",
-            pendingServices.map((service) => service.id),
-          )
-          .update({ paid: true, paid_at: now, updated_at: now });
+        await db.transaction(async (trx) => {
+          for (const service of pendingServices) {
+            await trx("outsourced_services")
+              .where({ id: service.id })
+              .update({
+                paid: true,
+                paid_at: now,
+                paid_amount: Number(service.service_cost_amount) || 0,
+                updated_at: now,
+              });
+          }
+        });
       }
 
       res.json({
@@ -3661,14 +3791,26 @@ app.get(
         .orderBy("delivered_at", "desc");
 
       const typeMap = await getOutsourcedServiceTypeMap();
-      res.json({
+      const responseBody = {
         ...normalizeOutsourcedServiceForRequest(service, req, typeMap),
         deliveries: deliveries.map((delivery) => ({
           ...delivery,
           items: parseOutsourcedItems(delivery.items),
           quantity: Number(delivery.quantity) || 0,
         })),
-      });
+      };
+
+      if (req.user?.role !== "employee") {
+        const payments = await db("outsourced_service_payments")
+          .where({ service_id: req.params.id })
+          .orderBy("paid_at", "desc");
+        responseBody.payments = payments.map((payment) => ({
+          ...payment,
+          amount: Number(payment.amount) || 0,
+        }));
+      }
+
+      res.json(responseBody);
     } catch (e) {
       console.error("Erro ao buscar servico terceirizado:", e);
       res.status(500).json({ error: "Erro ao buscar servico terceirizado" });
@@ -4121,6 +4263,88 @@ app.post(
       res
         .status(e.statusCode || 500)
         .json({ error: e.statusCode ? e.message : "Erro ao lancar entrega" });
+    }
+  },
+);
+
+app.post(
+  "/api/admin/outsourced-services/:id/payments",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const service = await db("outsourced_services")
+        .where({ id: req.params.id })
+        .first();
+
+      if (!service) {
+        return res.status(404).json({ error: "Servico nao encontrado" });
+      }
+
+      const serviceCostAmount = toNumberOrNull(service.service_cost_amount);
+      if (serviceCostAmount === null) {
+        return res.status(400).json({
+          error: "Servico nao possui valor cobrado pelo terceirizado definido",
+        });
+      }
+
+      const amount = toPositiveNumber(req.body.amount);
+      if (!amount) {
+        return res
+          .status(400)
+          .json({ error: "Valor pago deve ser maior que zero" });
+      }
+
+      const paidAt = toIsoDate(req.body.paid_at || req.body.paidAt) ||
+        new Date().toISOString();
+
+      const currentPaid = Number(service.paid_amount) || 0;
+      const remaining = roundCurrency(serviceCostAmount - currentPaid);
+      if (amount > remaining + 0.01) {
+        return res.status(400).json({
+          error: "Valor pago nao pode ser maior que o valor restante",
+        });
+      }
+
+      const now = new Date().toISOString();
+      const payment = {
+        id: req.body.id || `pay_${Date.now()}`,
+        service_id: req.params.id,
+        amount,
+        paid_at: paidAt,
+        observation: req.body.observation || null,
+        created_at: now,
+      };
+
+      const newPaidAmount = roundCurrency(currentPaid + amount);
+      const isFullyPaid = newPaidAmount >= serviceCostAmount - 0.01;
+
+      await db.transaction(async (trx) => {
+        await trx("outsourced_service_payments").insert(payment);
+        await trx("outsourced_services")
+          .where({ id: req.params.id })
+          .update({
+            paid_amount: newPaidAmount,
+            paid: isFullyPaid,
+            paid_at: isFullyPaid ? now : null,
+            updated_at: now,
+          });
+      });
+
+      const updated = await db("outsourced_services as s")
+        .leftJoin("outsourced_companies as c", "s.company_id", "c.id")
+        .select("s.*", "c.name as company_name")
+        .where("s.id", req.params.id)
+        .first();
+
+      const typeMap = await getOutsourcedServiceTypeMap();
+      res.status(201).json({
+        payment,
+        service: normalizeOutsourcedServiceForRequest(updated, req, typeMap),
+      });
+    } catch (e) {
+      console.error("Erro ao lancar pagamento de servico terceirizado:", e);
+      res.status(500).json({ error: "Erro ao lancar pagamento" });
     }
   },
 );
@@ -6446,6 +6670,118 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
   }
 });
 
+// Endpoint para lancar entrega (total ou parcial, por item) de um pedido ao cliente
+app.post("/api/orders/:id/deliveries", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const order = await db("orders").where({ id }).first();
+    if (!order) {
+      return res.status(404).json({ error: "Pedido não encontrado" });
+    }
+
+    const items = parseJSON(order.items);
+    const deliveredItems = parseJSON(order.deliveredItems);
+    if (isOrderFullyDelivered(items, deliveredItems)) {
+      return res
+        .status(400)
+        .json({ error: "Pedido ja foi totalmente entregue" });
+    }
+
+    const remainingItems = computeOrderRemainingItems(items, deliveredItems);
+    const remainingByProduct = new Map(
+      remainingItems.map((item) => [item.productId, item.quantity]),
+    );
+
+    const deliveryItemsInput =
+      req.body.mode === "all"
+        ? remainingItems.filter((item) => item.quantity > 0)
+        : Array.isArray(req.body.items)
+          ? req.body.items
+          : [];
+
+    const normalizedDeliveryItems = [];
+    for (const raw of deliveryItemsInput) {
+      const productId = raw?.productId || raw?.product_id;
+      const quantity = Number(raw?.quantity);
+      if (!productId || !quantity || quantity <= 0) continue;
+      const remaining = remainingByProduct.get(productId) || 0;
+      if (quantity > remaining + 0.0001) {
+        return res.status(400).json({
+          error: `Quantidade entregue maior que o restante do item ${productId}`,
+        });
+      }
+      normalizedDeliveryItems.push({ productId, quantity });
+    }
+
+    if (normalizedDeliveryItems.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Informe ao menos um item a entregar" });
+    }
+
+    const deliveredAt = req.body.delivered_at
+      ? new Date(req.body.delivered_at)
+      : new Date();
+    if (Number.isNaN(deliveredAt.getTime())) {
+      return res.status(400).json({ error: "Data de entrega invalida" });
+    }
+
+    const totalQuantity = normalizedDeliveryItems.reduce(
+      (sum, item) => sum + item.quantity,
+      0,
+    );
+
+    const now = new Date().toISOString();
+    const delivery = {
+      id: req.body.id || `orddel_${Date.now()}`,
+      order_id: id,
+      items: JSON.stringify(normalizedDeliveryItems),
+      quantity: totalQuantity,
+      delivered_at: deliveredAt.toISOString(),
+      observation: req.body.observation || null,
+      created_at: now,
+    };
+
+    const nextDeliveredMap = getOrderDeliveredQtyMap(deliveredItems);
+    for (const item of normalizedDeliveryItems) {
+      nextDeliveredMap.set(
+        item.productId,
+        (nextDeliveredMap.get(item.productId) || 0) + item.quantity,
+      );
+    }
+    const nextDeliveredItems = Array.from(nextDeliveredMap.entries()).map(
+      ([productId, quantity]) => ({ productId, quantity }),
+    );
+    const fullyDelivered = isOrderFullyDelivered(items, nextDeliveredItems);
+
+    const orderUpdates = {
+      deliveredItems: JSON.stringify(nextDeliveredItems),
+      entregueCliente: fullyDelivered,
+    };
+    if (fullyDelivered && !order.completedAt) {
+      orderUpdates.completedAt = now;
+    }
+
+    await db.transaction(async (trx) => {
+      await trx("order_deliveries").insert(delivery);
+      await trx("orders").where({ id }).update(orderUpdates);
+    });
+
+    const updatedOrder = await db("orders").where({ id }).first();
+    res.status(201).json({
+      delivery: {
+        ...delivery,
+        items: normalizedDeliveryItems,
+        quantity: totalQuantity,
+      },
+      order: normalizeOrderResponse(updatedOrder),
+    });
+  } catch (e) {
+    console.error("❌ Erro ao lancar entrega do pedido:", e);
+    res.status(500).json({ error: "Erro ao lancar entrega do pedido" });
+  }
+});
+
 app.put("/api/orders/:id", async (req, res) => {
   const { id } = req.params;
   let {
@@ -6528,14 +6864,26 @@ app.put("/api/orders/:id", async (req, res) => {
       updates.status = normalizedStatus;
       if (["delivered", "completed"].includes(normalizedStatus)) {
         updates.entregueCliente = true;
+        updates.deliveredItems = JSON.stringify(
+          computeOrderRemainingItems(parseJSON(order.items), []).map((item) => ({
+            productId: item.productId,
+            quantity: item.quantity,
+          })),
+        );
         if (!order.completedAt) updates.completedAt = new Date();
       }
     }
 
     if (entregueCliente !== undefined) {
       updates.entregueCliente = isTruthyDb(entregueCliente);
-      if (updates.entregueCliente && !order.completedAt) {
-        updates.completedAt = new Date();
+      if (updates.entregueCliente) {
+        updates.deliveredItems = JSON.stringify(
+          computeOrderRemainingItems(parseJSON(order.items), []).map((item) => ({
+            productId: item.productId,
+            quantity: item.quantity,
+          })),
+        );
+        if (!order.completedAt) updates.completedAt = new Date();
       }
     }
 

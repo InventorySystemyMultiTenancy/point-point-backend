@@ -293,11 +293,35 @@ router.get("/super-admin/receivables", superAdminAuth, async (req, res) => {
 router.put("/orders/:id/mark-delivered", async (req, res) => {
   try {
     const { id } = req.params;
+    const order = await db("orders").where({ id }).first();
+    if (!order) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Pedido não encontrado." });
+    }
+
     const checklistPayload =
       req.body?.separationChecklist !== undefined
         ? req.body.separationChecklist
         : req.body?.checklist;
     const updates = { entregueCliente: true };
+
+    // Marca todos os itens do pedido como totalmente entregues, para manter
+    // o rastreio de entrega parcial (deliveredItems) consistente com o
+    // endpoint dedicado POST /api/orders/:id/deliveries.
+    let orderItems = [];
+    try {
+      orderItems =
+        typeof order.items === "string" ? JSON.parse(order.items) : order.items || [];
+    } catch {
+      orderItems = [];
+    }
+    updates.deliveredItems = JSON.stringify(
+      orderItems.map((item) => ({
+        productId: item.productId,
+        quantity: Number(item.quantity) || 0,
+      })),
+    );
 
     if (checklistPayload !== undefined) {
       const isValidChecklist =
