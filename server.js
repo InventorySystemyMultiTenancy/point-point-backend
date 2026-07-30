@@ -1106,28 +1106,45 @@ const normalizeServiceCostItems = (items, expectedReturnItems = []) => {
 
   return parsed.map((item, index) => {
     const productId = getItemProductId(item);
-    const amount = Number(item?.amount);
 
     if (!productId) {
       throw validationError(
         `Informe o productId do custo de servico ${index + 1}.`,
       );
     }
-    if (!Number.isFinite(amount) || amount < 0) {
-      throw validationError(
-        `Informe amount maior ou igual a zero para o custo de servico ${index + 1}.`,
-      );
-    }
 
     const expectedItem = expectedReturnItems.find(
       (expected) => String(expected.productId) === String(productId),
     );
+    const expectedQty = Number(expectedItem?.quantity) || 0;
+
+    const rawUnitAmount = item?.unitAmount ?? item?.unit_amount;
+    const unitAmountProvided =
+      rawUnitAmount !== undefined && rawUnitAmount !== null && rawUnitAmount !== "";
+    const unitAmount = unitAmountProvided ? Number(rawUnitAmount) : null;
+
+    if (unitAmountProvided && (!Number.isFinite(unitAmount) || unitAmount < 0)) {
+      throw validationError(
+        `Informe um valor por unidade valido para o custo de servico ${index + 1}.`,
+      );
+    }
+
+    const amount = unitAmountProvided
+      ? roundCurrency(unitAmount * expectedQty)
+      : Number(item?.amount);
+
+    if (!unitAmountProvided && (!Number.isFinite(amount) || amount < 0)) {
+      throw validationError(
+        `Informe amount maior ou igual a zero para o custo de servico ${index + 1}.`,
+      );
+    }
 
     return {
       productId,
       id: productId,
       name: item?.name || expectedItem?.name || productId,
       amount: roundCurrency(amount),
+      unitAmount: unitAmountProvided ? roundCurrency(unitAmount) : null,
     };
   });
 };
@@ -1158,6 +1175,43 @@ const sumServiceCostItems = (serviceCostItems) =>
       (sum, item) => sum + (Number(item.amount) || 0),
       0,
     ),
+  );
+
+// Monta o mapa productId -> valor por unidade a partir dos custos cadastrados no
+// servico terceirizado, usado para calcular quanto pagar em cada entrega recebida.
+// Servicos antigos (sem unitAmount salvo) caem no fallback: amount total / qtd prevista.
+const buildOutsourcedUnitCostMap = (serviceCostItems, expectedReturnItems) => {
+  const map = new Map();
+  for (const item of Array.isArray(serviceCostItems) ? serviceCostItems : []) {
+    const productId = getItemProductId(item);
+    if (!productId) continue;
+
+    if (item.unitAmount !== undefined && item.unitAmount !== null) {
+      const unit = Number(item.unitAmount);
+      if (Number.isFinite(unit)) {
+        map.set(String(productId), unit);
+        continue;
+      }
+    }
+
+    const expectedItem = (
+      Array.isArray(expectedReturnItems) ? expectedReturnItems : []
+    ).find((expected) => String(getItemProductId(expected)) === String(productId));
+    const expectedQty = Number(expectedItem?.quantity) || 0;
+    const amount = Number(item?.amount);
+    if (expectedQty > 0 && Number.isFinite(amount)) {
+      map.set(String(productId), amount / expectedQty);
+    }
+  }
+  return map;
+};
+
+const calculateOutsourcedDeliveryAmountDue = (deliveryItems, unitCostMap) =>
+  roundCurrency(
+    (Array.isArray(deliveryItems) ? deliveryItems : []).reduce((sum, item) => {
+      const unit = unitCostMap.get(String(getItemProductId(item)));
+      return unit != null ? sum + unit * (Number(item.quantity) || 0) : sum;
+    }, 0),
   );
 
 const isFabricCuttingServiceType = (serviceType, typeConfig) =>
@@ -2320,6 +2374,7 @@ async function initDatabase() {
       table.string("product_name");
       table.text("items");
       table.decimal("quantity", 12, 3).notNullable();
+      table.decimal("amount_due", 12, 2);
       table.timestamp("delivered_at").notNullable();
       table.text("observation");
       table.timestamp("created_at").defaultTo(db.fn.now());
@@ -2330,6 +2385,7 @@ async function initDatabase() {
       { name: "product_id", type: "string" },
       { name: "product_name", type: "string" },
       { name: "items", type: "text" },
+      { name: "amount_due", type: "decimal" },
     ];
     for (const col of outsourcedDeliveryColumns) {
       const hasCol = await db.schema.hasColumn(
@@ -2340,6 +2396,7 @@ async function initDatabase() {
         await db.schema.table("outsourced_service_deliveries", (table) => {
           if (col.type === "string") table.string(col.name);
           if (col.type === "text") table.text(col.name);
+          if (col.type === "decimal") table.decimal(col.name, 12, 2);
         });
         console.log(
           `Coluna ${col.name} adicionada a outsourced_service_deliveries`,
@@ -3790,6 +3847,7 @@ app.get(
         .where({ service_id: req.params.id })
         .orderBy("delivered_at", "desc");
 
+      const isEmployeeRequester = req.user?.role === "employee";
       const typeMap = await getOutsourcedServiceTypeMap();
       const responseBody = {
         ...normalizeOutsourcedServiceForRequest(service, req, typeMap),
@@ -3797,6 +3855,10 @@ app.get(
           ...delivery,
           items: parseOutsourcedItems(delivery.items),
           quantity: Number(delivery.quantity) || 0,
+          amount_due:
+            !isEmployeeRequester && delivery.amount_due != null
+              ? Number(delivery.amount_due)
+              : null,
         })),
       };
 
@@ -4207,6 +4269,15 @@ app.post(
       const now = new Date().toISOString();
       const newStatus = newDelivered >= expectedReturn ? "concluido" : "pendente";
 
+      const unitCostMap = buildOutsourcedUnitCostMap(
+        parseJSON(service.service_cost_items),
+        parseJSON(service.expected_return_items),
+      );
+      const amountDue = calculateOutsourcedDeliveryAmountDue(
+        deliveryItems,
+        unitCostMap,
+      );
+
       const delivery = {
         id: req.body.id || `del_${Date.now()}`,
         service_id: req.params.id,
@@ -4214,6 +4285,7 @@ app.post(
         product_name: deliveryItems.length === 1 ? deliveryItems[0].name : null,
         items: toJsonText(deliveryItems),
         quantity,
+        amount_due: unitCostMap.size > 0 ? amountDue : null,
         delivered_at: deliveredAt,
         observation: req.body.observation || null,
         created_at: now,
@@ -4255,6 +4327,7 @@ app.post(
           ...delivery,
           items: deliveryItems,
           quantity: Number(delivery.quantity) || 0,
+          amount_due: req.user?.role === "employee" ? null : delivery.amount_due,
         },
         service: normalizeOutsourcedServiceForRequest(updated, req, typeMap),
       });
