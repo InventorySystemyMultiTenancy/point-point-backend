@@ -183,9 +183,8 @@ export function generateStyledOrderPdf(order) {
   y = Math.max(leftCurrentY, rightCurrentY) + 16;
 
   // Tabela de produtos
-  doc.font("Helvetica-Bold").fontSize(14).text("PRODUTOS", 40, y);
-  y += 24;
   const pageRight = doc.page.width - doc.page.margins.right;
+  const pageBottom = doc.page.height - doc.page.margins.bottom;
   const tableX = doc.page.margins.left;
   const qtyWidth = 44;
   const unitWidth = 78;
@@ -196,17 +195,35 @@ export function generateStyledOrderPdf(order) {
   const qtyX = unitX - gap - qtyWidth;
   const productWidth = qtyX - gap - tableX;
 
-  doc
-    .fontSize(11)
-    .font("Helvetica-Bold")
-    .text("Produto", tableX, y, { width: productWidth })
-    .text("Qtd", qtyX, y, { width: qtyWidth, align: "right" })
-    .text("Valor Unit.", unitX, y, { width: unitWidth, align: "right" })
-    .text("Subtotal", subtotalX, y, {
-      width: subtotalWidth,
-      align: "right",
-    });
-  y += 18;
+  // Garante espaço para o conteúdo que vem a seguir; se não couber na página
+  // atual, começa uma nova página antes de desenhar, evitando que um bloco
+  // (ex.: uma linha da tabela) fique dividido entre duas páginas.
+  const ensureSpace = (neededHeight) => {
+    if (y + neededHeight > pageBottom) {
+      doc.addPage();
+      y = doc.page.margins.top;
+    }
+  };
+
+  const drawTableHeader = () => {
+    ensureSpace(24 + 18);
+    doc.font("Helvetica-Bold").fontSize(14).text("PRODUTOS", 40, y);
+    y += 24;
+    doc
+      .fontSize(11)
+      .font("Helvetica-Bold")
+      .text("Produto", tableX, y, { width: productWidth })
+      .text("Qtd", qtyX, y, { width: qtyWidth, align: "right" })
+      .text("Valor Unit.", unitX, y, { width: unitWidth, align: "right" })
+      .text("Subtotal", subtotalX, y, {
+        width: subtotalWidth,
+        align: "right",
+      });
+    y += 18;
+  };
+
+  drawTableHeader();
+
   // Exibe produtos comprados
   (order.items || []).forEach((item) => {
     const nome =
@@ -224,12 +241,24 @@ export function generateStyledOrderPdf(order) {
         : item.valor_unit || item.unit_price || 0;
     const numericQtd = toNumber(qtd) || 1;
     const numericValor = toNumber(valor);
-    const rowTop = y;
     const productOptions = {
       width: productWidth,
       height: 28,
       ellipsis: true,
     };
+    const nameHeight = doc.heightOfString(nome, productOptions);
+    const rowHeight = Math.max(16, Math.min(28, nameHeight)) + 4;
+
+    // Se a linha não couber na página atual, começa uma nova página e
+    // redesenha o cabeçalho da tabela, mantendo todas as colunas da linha
+    // alinhadas na mesma página.
+    if (y + rowHeight > pageBottom) {
+      doc.addPage();
+      y = doc.page.margins.top;
+      drawTableHeader();
+    }
+
+    const rowTop = y;
     doc.font("Helvetica").fontSize(11);
     doc
       .text(nome, tableX, rowTop, productOptions)
@@ -245,11 +274,11 @@ export function generateStyledOrderPdf(order) {
         width: subtotalWidth,
         align: "right",
       });
-    const nameHeight = doc.heightOfString(nome, productOptions);
-    y += Math.max(16, Math.min(28, nameHeight)) + 4;
+    y = rowTop + rowHeight;
   });
 
   // Total
+  ensureSpace(10 + 22);
   y += 10;
   doc
     .font("Helvetica-Bold")
@@ -264,19 +293,21 @@ export function generateStyledOrderPdf(order) {
   y += 32;
 
   // Observações
+  const observacoesText =
+    order.observation || order.observacoes || order.observacao || "-";
+  const observacoesHeight = doc
+    .font("Helvetica")
+    .fontSize(11)
+    .heightOfString(observacoesText, { width: 500 });
+  ensureSpace(18 + observacoesHeight);
   doc
     .font("Helvetica-Bold")
     .fontSize(12)
     .text("OBSERVAÇÕES", 40, y)
     .font("Helvetica")
     .fontSize(11)
-    .text(
-      order.observation || order.observacoes || order.observacao || "-",
-      40,
-      y + 18,
-      { width: 500 },
-    );
-  y += 44;
+    .text(observacoesText, 40, y + 18, { width: 500 });
+  y += 18 + observacoesHeight;
 
   doc.end();
   return done;

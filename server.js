@@ -1051,9 +1051,18 @@ const normalizeLabelKey = (value) =>
     .trim()
     .toLowerCase();
 
-const isSewingServiceType = (serviceType, typeConfig) =>
-  getOutsourcedServiceTypeKey(serviceType) === "sewing" ||
-  normalizeLabelKey(typeConfig?.label) === "costura";
+// Servicos que permitem cadastrar o valor por produto (ex.: por pelucia) e somam o
+// total automaticamente: costura, fechamento e enchimento + fechamento (combinado).
+const usesPerProductServiceCost = (serviceType, typeConfig) => {
+  const key = getOutsourcedServiceTypeKey(serviceType);
+  const label = normalizeLabelKey(typeConfig?.label);
+  return (
+    key === "sewing" ||
+    key === "closing" ||
+    label === "costura" ||
+    label.includes("fechamento")
+  );
+};
 
 const normalizeServiceCostItems = (items, expectedReturnItems = []) => {
   if (items === undefined || items === null || items === "") {
@@ -3932,8 +3941,8 @@ app.post(
         expectedReturnItems,
       );
       const serviceCostItemsTotal = sumServiceCostItems(serviceCostItems);
-      const sewingService = isSewingServiceType(serviceType, typeConfig);
-      const serviceCostAmount = sewingService
+      const perProductCostService = usesPerProductServiceCost(serviceType, typeConfig);
+      const serviceCostAmount = perProductCostService
         ? serviceCostItemsTotal
         : rawServiceCostAmount ?? (serviceCostItems.length ? serviceCostItemsTotal : null);
 
@@ -3960,7 +3969,7 @@ app.post(
           .status(400)
           .json({ error: "Valor pago pelo tecido nao pode ser negativo" });
       }
-      if (sewingService) {
+      if (perProductCostService) {
         validateSewingServiceCostItems(serviceCostItems, expectedReturnItems);
       }
       if (serviceCostAmount !== null && serviceCostAmount < 0) {
@@ -4127,8 +4136,8 @@ app.put(
             existing.service_cost_amount === undefined
           ? null
           : Number(existing.service_cost_amount);
-      const sewingService = isSewingServiceType(serviceType, typeConfig);
-      const serviceCostAmount = sewingService
+      const perProductCostService = usesPerProductServiceCost(serviceType, typeConfig);
+      const serviceCostAmount = perProductCostService
         ? serviceCostItemsTotal
         : rawServiceCostAmount ??
           (serviceCostItemsProvided && serviceCostItems.length
@@ -4158,7 +4167,7 @@ app.put(
           .status(400)
           .json({ error: "Valor pago pelo tecido nao pode ser negativo" });
       }
-      if (sewingService) {
+      if (perProductCostService) {
         validateSewingServiceCostItems(serviceCostItems, expectedReturnItems);
       }
       if (serviceCostAmount !== null && serviceCostAmount < 0) {
