@@ -240,6 +240,7 @@ const normalizeOrderResponse = (order) => {
     total: parseFloat(order.total),
     separationChecklist: parseSeparationChecklist(order.separationChecklist),
     entregueCliente: isTruthyDb(order.entregueCliente),
+    recebimentoConfirmado: isTruthyDb(order.recebimentoConfirmado),
     deliveredItems,
     remainingItems: computeOrderRemainingItems(items, deliveredItems),
   };
@@ -2101,6 +2102,39 @@ async function initDatabase() {
       });
       console.log(`Coluna '${col.name}' adicionada a orders`);
     }
+  }
+
+  // Data em que o pedido foi marcado como pago e confirmacao de recebimento
+  // pelo cliente apos a entrega
+  const paymentAndReceiptColumns = [
+    { name: "paidAt", type: "timestamp" },
+    { name: "recebimentoConfirmado", type: "boolean" },
+    { name: "recebimentoConfirmadoAt", type: "timestamp" },
+  ];
+  let receiptColumnCreated = false;
+  for (const col of paymentAndReceiptColumns) {
+    const hasCol = await db.schema.hasColumn("orders", col.name);
+    if (!hasCol) {
+      await db.schema.table("orders", (table) => {
+        if (col.type === "boolean") table.boolean(col.name).defaultTo(false);
+        if (col.type === "timestamp") table.timestamp(col.name);
+      });
+      if (col.name === "recebimentoConfirmado") receiptColumnCreated = true;
+      console.log(`Coluna '${col.name}' adicionada a orders`);
+    }
+  }
+  // Pedidos entregues antes da confirmacao de recebimento existir ja contam
+  // como confirmados (roda so uma vez, quando a coluna e criada)
+  if (receiptColumnCreated) {
+    const backfilled = await db("orders")
+      .where("entregueCliente", true)
+      .update({
+        recebimentoConfirmado: true,
+        recebimentoConfirmadoAt: db.raw("??", ["completedAt"]),
+      });
+    console.log(
+      `✅ ${backfilled} pedido(s) já entregue(s) marcado(s) como recebimento confirmado`,
+    );
   }
 
   if (!(await db.schema.hasTable("order_products"))) {
@@ -6659,6 +6693,7 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
     await db("orders").where({ id }).update({
       paymentStatus: "paid",
       stockDeducted: true,
+      paidAt: new Date().toISOString(),
     });
     res.json({
       success: true,
@@ -6669,6 +6704,79 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
     res.status(500).json({ error: "Erro ao marcar pedido como pago" });
   }
 });
+
+// Endpoint para desfazer o "pago" de um pedido presencial (volta para pendente).
+// O estoque permanece descontado (stockDeducted continua true), entao marcar
+// como pago novamente nao desconta o estoque em dobro.
+app.put(
+  "/api/orders/:id/mark-unpaid",
+  authenticateToken,
+  async (req, res) => {
+    const { id } = req.params;
+    if (!["admin", "superadmin", "kitchen"].includes(req.user?.role)) {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+    try {
+      const order = await db("orders").where({ id }).first();
+      if (!order) {
+        return res.status(404).json({ error: "Pedido não encontrado" });
+      }
+      if (order.paymentType !== "presencial") {
+        return res.status(400).json({
+          error: "Somente pedidos com pagamento presencial podem voltar a pendente",
+        });
+      }
+      if (order.paymentStatus !== "paid") {
+        return res.status(400).json({ error: "Pedido não está marcado como pago" });
+      }
+
+      await db("orders").where({ id }).update({
+        paymentStatus: "pending",
+        paidAt: null,
+      });
+      res.json({ success: true, message: "Pedido voltou para pendente" });
+    } catch (e) {
+      console.error("❌ Erro ao desfazer pagamento do pedido:", e);
+      res.status(500).json({ error: "Erro ao desfazer pagamento do pedido" });
+    }
+  },
+);
+
+// Endpoint para o cliente confirmar que recebeu o pedido entregue
+app.post(
+  "/api/orders/:id/confirm-receipt",
+  authenticateToken,
+  async (req, res) => {
+    const { id } = req.params;
+    try {
+      const order = await db("orders").where({ id }).first();
+      if (!order) {
+        return res.status(404).json({ error: "Pedido não encontrado" });
+      }
+      if (String(order.userId) !== String(req.user?.userId)) {
+        return res
+          .status(403)
+          .json({ error: "Este pedido não pertence a este cliente" });
+      }
+      if (!isTruthyDb(order.entregueCliente)) {
+        return res
+          .status(400)
+          .json({ error: "O pedido ainda não foi totalmente entregue" });
+      }
+      if (!isTruthyDb(order.recebimentoConfirmado)) {
+        await db("orders").where({ id }).update({
+          recebimentoConfirmado: true,
+          recebimentoConfirmadoAt: new Date().toISOString(),
+        });
+      }
+      const updated = await db("orders").where({ id }).first();
+      res.json({ success: true, order: normalizeOrderResponse(updated) });
+    } catch (e) {
+      console.error("❌ Erro ao confirmar recebimento do pedido:", e);
+      res.status(500).json({ error: "Erro ao confirmar recebimento" });
+    }
+  },
+);
 
 // Endpoint para lancar entrega (total ou parcial, por item) de um pedido ao cliente
 app.post("/api/orders/:id/deliveries", async (req, res) => {
