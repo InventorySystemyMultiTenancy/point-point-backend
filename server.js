@@ -13,6 +13,7 @@ import cors from "cors";
 import OpenAI from "openai";
 import knex from "knex";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import { createClient } from "redis";
 import { MercadoPagoConfig, Payment, Preference } from "mercadopago";
 import paymentRoutes from "./routes/payment.js";
@@ -642,7 +643,46 @@ const getUserProductPricesPayload = async (userId) => {
   };
 };
 
-const normalizeUserResponse = (user) => ({
+// ========== HASH DE SENHAS (scrypt nativo do Node) ==========
+const PASSWORD_HASH_PREFIX = "scrypt$";
+
+const isPasswordHashed = (stored) =>
+  typeof stored === "string" && stored.startsWith(PASSWORD_HASH_PREFIX);
+
+const hashPassword = (plain) =>
+  new Promise((resolve, reject) => {
+    const salt = crypto.randomBytes(16).toString("hex");
+    crypto.scrypt(String(plain), salt, 64, (err, derived) => {
+      if (err) return reject(err);
+      resolve(`${PASSWORD_HASH_PREFIX}${salt}$${derived.toString("hex")}`);
+    });
+  });
+
+const verifyPassword = (plain, stored) =>
+  new Promise((resolve, reject) => {
+    if (stored === undefined || stored === null || stored === "") {
+      return resolve(false);
+    }
+    if (!isPasswordHashed(stored)) {
+      // Senha legada em texto puro (antes da migração)
+      const a = Buffer.from(String(plain));
+      const b = Buffer.from(String(stored));
+      return resolve(a.length === b.length && crypto.timingSafeEqual(a, b));
+    }
+    const [, salt, hashHex] = stored.split("$");
+    if (!salt || !hashHex) return resolve(false);
+    crypto.scrypt(String(plain), salt, 64, (err, derived) => {
+      if (err) return reject(err);
+      const expected = Buffer.from(hashHex, "hex");
+      resolve(
+        expected.length === derived.length &&
+          crypto.timingSafeEqual(expected, derived),
+      );
+    });
+  });
+
+// Nunca devolve a senha (nem o hash) nas respostas da API
+const normalizeUserResponse = ({ password: _password, ...user } = {}) => ({
   ...user,
   historico: parseJSON(user?.historico),
   fullAccess: userHasFullAccess(user),
@@ -1798,6 +1838,25 @@ async function initDatabase() {
     }
   }
 
+  // Migração: converte senhas em texto puro para hash scrypt
+  const usersWithPassword = await db("users")
+    .select("id", "password")
+    .whereNotNull("password")
+    .whereNot("password", "");
+  const plainPasswordUsers = usersWithPassword.filter(
+    (u) => !isPasswordHashed(u.password),
+  );
+  for (const u of plainPasswordUsers) {
+    await db("users")
+      .where({ id: u.id })
+      .update({ password: await hashPassword(u.password) });
+  }
+  if (plainPasswordUsers.length > 0) {
+    console.log(
+      `🔐 ${plainPasswordUsers.length} senha(s) de usuários convertida(s) para hash`,
+    );
+  }
+
   // Recurso de "fechamento mensal" descontinuado: remove a coluna antiga
   const hasLegacyMonthlyPaymentColumn = await db.schema.hasColumn(
     "users",
@@ -2561,9 +2620,15 @@ async function initDatabase() {
         return res.status(404).json({ error: "Usuário não encontrado" });
       }
 
-      // Nota: Em produção, use bcrypt para comparar senhas!
-      if (user.password !== password) {
+      if (!(await verifyPassword(password, user.password))) {
         return res.status(401).json({ error: "Senha incorreta" });
+      }
+
+      // Garante que senhas legadas sejam convertidas para hash
+      if (!isPasswordHashed(user.password)) {
+        await db("users")
+          .where({ id: user.id })
+          .update({ password: await hashPassword(password) });
       }
 
       const normalizedRole = user.role || "customer";
@@ -6212,7 +6277,7 @@ app.post("/api/users/register", async (req, res) => {
     console.log(`📝 Cadastrando novo usuário: ${name} (${docClean})`);
 
     const newUser = {
-      password: password, // Lembrete: considere usar bcrypt no futuro para segurança
+      password: await hashPassword(password),
       id: `user_${Date.now()}`,
       name: name.trim(),
       email: email.trim(),
@@ -6231,8 +6296,15 @@ app.post("/api/users/register", async (req, res) => {
 
     console.log(`✅ Usuário cadastrado com sucesso: ${newUser.id}`);
 
+    const token = JWT_SECRET
+      ? jwt.sign({ role: "customer", userId: newUser.id }, JWT_SECRET, {
+          expiresIn: "8h",
+        })
+      : null;
+
     res.status(201).json({
       success: true,
+      token,
       user: normalizeUserResponse(newUser),
     });
   } catch (e) {
@@ -9945,34 +10017,101 @@ app.get("/api/payment-online/status/:paymentId", async (req, res) => {
 
 // ==========================================
 
-app.put("/api/users/:id", async (req, res) => {
+app.put("/api/users/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { name, email, cpf, cep, address, phone, password, fullAccess, chequePayment } = req.body;
-  if (!name || !email || !cpf || !cep || !address || !phone || !password) {
-    return res.status(400).json({ error: "Todos os campos são obrigatórios" });
+  const { fullAccess, chequePayment } = req.body;
+
+  // Só o próprio usuário ou um admin pode editar
+  const requesterIsAdmin =
+    req.user?.role === "admin" || req.user?.role === "superadmin";
+  if (!requesterIsAdmin && String(req.user?.userId) !== String(id)) {
+    return res
+      .status(403)
+      .json({ error: "Você não tem permissão para editar este usuário" });
   }
+  if (!requesterIsAdmin && (fullAccess !== undefined || chequePayment !== undefined)) {
+    return res
+      .status(403)
+      .json({ error: "Apenas administradores podem alterar permissões" });
+  }
+  const phoneInput =
+    req.body.phone !== undefined ? req.body.phone : req.body.telefone;
+
+  // Atualização parcial: só altera os campos enviados.
+  // Campos enviados não podem ficar vazios (exceto senha vazia = manter atual).
+  const updates = {};
+  const textFields = {
+    name: req.body.name,
+    email: req.body.email,
+    cep: req.body.cep,
+    address: req.body.address,
+    phone: phoneInput,
+  };
+  for (const [field, value] of Object.entries(textFields)) {
+    if (value === undefined) continue;
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed && (field === "name" || field === "email")) {
+      return res.status(400).json({ error: `Campo '${field}' não pode ficar vazio` });
+    }
+    updates[field] = trimmed;
+  }
+
+  if (updates.email !== undefined && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(updates.email)) {
+    return res.status(400).json({ error: "Email inválido" });
+  }
+
+  if (req.body.cpf !== undefined) {
+    const docClean = String(req.body.cpf ?? "").replace(/\D/g, "");
+    if (docClean.length !== 11 && docClean.length !== 14) {
+      return res.status(400).json({ error: "Documento inválido. Deve ser CPF ou CNPJ." });
+    }
+    updates.cpf = docClean;
+  }
+
+  if (req.body.password !== undefined && req.body.password !== null) {
+    const password = String(req.body.password);
+    if (password.trim()) {
+      if (password.trim().length < 6) {
+        return res.status(400).json({ error: "Senha deve ter no mínimo 6 caracteres" });
+      }
+      updates.password = await hashPassword(password.trim());
+    }
+  }
+
+  if (fullAccess !== undefined) updates.fullAccess = isTruthyDb(fullAccess);
+  if (chequePayment !== undefined) updates.chequePayment = isTruthyDb(chequePayment);
+
   try {
     // Verifica se o usuário existe
     const user = await db("users").where({ id }).first();
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
-    // Atualiza os dados do usuário
-    await db("users")
-      .where({ id })
-      .update({
-        name: name.trim(),
-        email: email.trim(),
-        cpf: String(cpf).replace(/\D/g, ""),
-        cep: cep.trim(),
-        address: address.trim(),
-        phone: phone.trim(),
-        password: password,
-        ...(fullAccess !== undefined ? { fullAccess: isTruthyDb(fullAccess) } : {}),
-        ...(chequePayment !== undefined
-          ? { chequePayment: isTruthyDb(chequePayment) }
-          : {}),
-      });
+
+    if (updates.cpf && updates.cpf !== user.cpf) {
+      const docInUse = await db("users")
+        .where({ cpf: updates.cpf })
+        .whereNot({ id })
+        .first();
+      if (docInUse) {
+        return res.status(409).json({ error: "CPF/CNPJ já cadastrado para outro usuário" });
+      }
+    }
+
+    if (updates.email && updates.email.toLowerCase() !== String(user.email || "").toLowerCase()) {
+      const emailInUse = await db("users")
+        .whereRaw("LOWER(email) = ?", [updates.email.toLowerCase()])
+        .whereNot({ id })
+        .first();
+      if (emailInUse) {
+        return res.status(409).json({ error: "Email já cadastrado para outro usuário" });
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      await db("users").where({ id }).update(updates);
+    }
+
     // Retorna o usuário atualizado
     const updatedUser = await db("users").where({ id }).first();
     res.json({
