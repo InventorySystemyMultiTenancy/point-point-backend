@@ -2167,6 +2167,8 @@ async function initDatabase() {
   // pelo cliente apos a entrega
   const paymentAndReceiptColumns = [
     { name: "paidAt", type: "timestamp" },
+    { name: "readyAt", type: "timestamp" },
+    { name: "readyBy", type: "string" },
     { name: "recebimentoConfirmado", type: "boolean" },
     { name: "recebimentoConfirmadoAt", type: "timestamp" },
   ];
@@ -2177,6 +2179,7 @@ async function initDatabase() {
       await db.schema.table("orders", (table) => {
         if (col.type === "boolean") table.boolean(col.name).defaultTo(false);
         if (col.type === "timestamp") table.timestamp(col.name);
+        if (col.type === "string") table.string(col.name);
       });
       if (col.name === "recebimentoConfirmado") receiptColumnCreated = true;
       console.log(`Coluna '${col.name}' adicionada a orders`);
@@ -2962,6 +2965,32 @@ const authorizeKitchen = (req, res, next) => {
   }
   next();
 };
+
+const STAFF_ROLES = new Set(["employee", "kitchen", "admin", "superadmin"]);
+
+const authorizeStaff = (req, res, next) => {
+  if (!STAFF_ROLES.has(req.user?.role)) {
+    return res.status(403).json({
+      error: "Acesso negado. Apenas funcionários e administradores.",
+    });
+  }
+  next();
+};
+
+// Lê o token (se houver) sem bloquear a requisição
+const getOptionalTokenUser = (req) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token || !JWT_SECRET) return null;
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
+};
+
+const getStaffName = (user) =>
+  user?.name || user?.username || user?.role || null;
 
 const authenticateAdminOrderEvents = (req, res, next) => {
   const authHeader = req.headers["authorization"];
@@ -6851,7 +6880,11 @@ app.post(
 );
 
 // Endpoint para lancar entrega (total ou parcial, por item) de um pedido ao cliente
-app.post("/api/orders/:id/deliveries", async (req, res) => {
+app.post(
+  "/api/orders/:id/deliveries",
+  authenticateToken,
+  authorizeStaff,
+  async (req, res) => {
   const { id } = req.params;
   try {
     const order = await db("orders").where({ id }).first();
@@ -6938,8 +6971,9 @@ app.post("/api/orders/:id/deliveries", async (req, res) => {
       deliveredItems: JSON.stringify(nextDeliveredItems),
       entregueCliente: fullyDelivered,
     };
-    if (fullyDelivered && !order.completedAt) {
-      orderUpdates.completedAt = now;
+    if (fullyDelivered) {
+      orderUpdates.status = "delivered";
+      if (!order.completedAt) orderUpdates.completedAt = now;
     }
 
     await db.transaction(async (trx) => {
@@ -6960,7 +6994,46 @@ app.post("/api/orders/:id/deliveries", async (req, res) => {
     console.error("❌ Erro ao lancar entrega do pedido:", e);
     res.status(500).json({ error: "Erro ao lancar entrega do pedido" });
   }
-});
+  },
+);
+
+// Marca o pedido como pronto (aguardando retirada ou envio)
+app.post(
+  "/api/orders/:id/ready",
+  authenticateToken,
+  authorizeStaff,
+  async (req, res) => {
+    const { id } = req.params;
+    try {
+      const order = await db("orders").where({ id }).first();
+      if (!order) {
+        return res.status(404).json({ error: "Pedido não encontrado" });
+      }
+      if (isTruthyDb(order.entregueCliente)) {
+        return res.status(400).json({ error: "Pedido já foi retirado" });
+      }
+      if (["canceled", "cancelled", "expired"].includes(order.status)) {
+        return res.status(400).json({ error: "Pedido cancelado" });
+      }
+
+      if (!order.readyAt) {
+        await db("orders")
+          .where({ id })
+          .update({
+            status: "ready",
+            readyAt: new Date(),
+            readyBy: getStaffName(req.user),
+          });
+      }
+
+      const updated = await db("orders").where({ id }).first();
+      res.json({ success: true, order: normalizeOrderResponse(updated) });
+    } catch (e) {
+      console.error("❌ Erro ao marcar pedido como pronto:", e);
+      res.status(500).json({ error: "Erro ao marcar pedido como pronto" });
+    }
+  },
+);
 
 app.put("/api/orders/:id", async (req, res) => {
   const { id } = req.params;
@@ -6998,6 +7071,18 @@ app.put("/api/orders/:id", async (req, res) => {
       ) {
         paymentId = null;
       }
+    }
+
+    const staffOnlyStatuses = ["ready", "delivered", "completed"];
+    const wantsStaffChange =
+      entregueCliente !== undefined ||
+      (status !== undefined &&
+        staffOnlyStatuses.includes(String(status).trim()));
+    if (wantsStaffChange && !STAFF_ROLES.has(getOptionalTokenUser(req)?.role)) {
+      return res.status(403).json({
+        error:
+          "Apenas funcionários e administradores podem marcar o pedido como pronto ou retirado",
+      });
     }
 
     const updates = {};
@@ -7042,6 +7127,10 @@ app.put("/api/orders/:id", async (req, res) => {
       }
 
       updates.status = normalizedStatus;
+      if (normalizedStatus === "ready" && !order.readyAt) {
+        updates.readyAt = new Date();
+        updates.readyBy = getStaffName(getOptionalTokenUser(req));
+      }
       if (["delivered", "completed"].includes(normalizedStatus)) {
         updates.entregueCliente = true;
         updates.deliveredItems = JSON.stringify(
