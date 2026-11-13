@@ -1085,6 +1085,38 @@ const parseOutsourcedItems = (value) => {
   return Array.isArray(parsed) ? parsed : [];
 };
 
+const OUTSOURCED_QTY_EPSILON = 0.0001;
+
+// Soma quantidades por produto de uma lista de itens
+const sumOutsourcedItemsByProduct = (items) => {
+  const map = new Map();
+  for (const item of items || []) {
+    const productId = getItemProductId(item);
+    const quantity = Number(item?.quantity) || 0;
+    if (!productId || quantity <= 0) continue;
+    map.set(productId, (map.get(productId) || 0) + quantity);
+  }
+  return map;
+};
+
+// Quantidade ja recebida de cada produto em um servico terceirizado
+const buildOutsourcedReceivedMap = (deliveries) => {
+  const map = new Map();
+  for (const delivery of deliveries || []) {
+    const items = parseOutsourcedItems(delivery.items);
+    const source =
+      items.length > 0
+        ? items
+        : delivery.product_id
+          ? [{ productId: delivery.product_id, quantity: delivery.quantity }]
+          : [];
+    for (const [productId, quantity] of sumOutsourcedItemsByProduct(source)) {
+      map.set(productId, (map.get(productId) || 0) + quantity);
+    }
+  }
+  return map;
+};
+
 const normalizeLabelKey = (value) =>
   String(value || "")
     .normalize("NFD")
@@ -4391,11 +4423,54 @@ app.post(
         return res.status(400).json({ error: "Data da entrega invalida" });
       }
 
+      // Limite por item: nunca receber mais do que o esperado de cada produto
+      const expectedMap = sumOutsourcedItemsByProduct(
+        parseOutsourcedItems(service.expected_return_items),
+      );
+      const previousDeliveries = await db("outsourced_service_deliveries")
+        .where({ service_id: req.params.id })
+        .select("items", "product_id", "quantity");
+      const receivedMap = buildOutsourcedReceivedMap(previousDeliveries);
+      const requestedMap = sumOutsourcedItemsByProduct(deliveryItems);
+
+      if (expectedMap.size > 0) {
+        for (const [productId, requestedQty] of requestedMap) {
+          const itemName =
+            deliveryItems.find((item) => item.productId === productId)?.name ||
+            productId;
+          if (!expectedMap.has(productId)) {
+            return res.status(400).json({
+              error: `${itemName} nao faz parte dos itens esperados deste servico.`,
+            });
+          }
+          const expectedQty = expectedMap.get(productId);
+          const receivedQty = receivedMap.get(productId) || 0;
+          const remainingQty = Math.max(0, expectedQty - receivedQty);
+          if (requestedQty > remainingQty + OUTSOURCED_QTY_EPSILON) {
+            return res.status(400).json({
+              error:
+                remainingQty <= OUTSOURCED_QTY_EPSILON
+                  ? `${itemName} ja foi recebido por completo (${receivedQty} de ${expectedQty}).`
+                  : `${itemName}: ja recebido ${receivedQty} de ${expectedQty}. Falta receber no maximo ${remainingQty}.`,
+            });
+          }
+        }
+      }
+
       const currentDelivered = Number(service.total_delivered_quantity) || 0;
       const expectedReturn = Number(service.expected_return_quantity) || 0;
       const newDelivered = currentDelivered + quantity;
       const now = new Date().toISOString();
-      const newStatus = newDelivered >= expectedReturn ? "concluido" : "pendente";
+      let allItemsReceived = newDelivered >= expectedReturn;
+      if (expectedMap.size > 0) {
+        allItemsReceived = Array.from(expectedMap.entries()).every(
+          ([productId, expectedQty]) =>
+            (receivedMap.get(productId) || 0) +
+              (requestedMap.get(productId) || 0) >=
+            expectedQty - OUTSOURCED_QTY_EPSILON,
+        );
+      }
+      const newStatus = allItemsReceived ? "concluido" : "pendente";
 
       const unitCostMap = buildOutsourcedUnitCostMap(
         parseJSON(service.service_cost_items),
